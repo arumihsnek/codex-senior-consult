@@ -22,6 +22,7 @@ VERSION = "2.0.0"
 BUNDLE_SCHEMA = "codex-senior-consult/v1"
 RESPONSE_SCHEMA = "codex-senior-consult-response/v2"
 LEGACY_RESPONSE_SCHEMA = "codex-senior-consult-response/v1"
+RESPONSE_ARTIFACT_SCHEMA = "codex-senior-consult-response-artifact/v1"
 MODES = {"integrated-review", "plan", "plan-review", "replan", "blocker-analysis", "risk-audit", "final-review", "merge-gate"}
 EFFORTS = {"low", "medium", "high", "xhigh"}
 MEDIUM_TRIGGERS = {"cross_cutting_architecture", "security", "credentials", "process_isolation", "contradictory_evidence", "concurrency", "duplicate_side_effects", "public_contract", "destructive_migration", "alternatives_tie", "conceptual_plan_failure", "recovery"}
@@ -55,12 +56,24 @@ def secure_dir(path: Path) -> None:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode): raise ConsultError("INVALID_STATE_PATH", ["state directory must be a real directory"])
     path.chmod(0o700)
 
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
 def secure_write(path: Path, data: str) -> None:
     secure_dir(path.parent)
     if os.path.lexists(path) and stat.S_ISLNK(path.lstat().st_mode): raise ConsultError("INVALID_STATE_PATH", ["refusing symlink state file"])
     fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600); os.write(fd, data.encode()); os.fsync(fd); os.close(fd); fd = -1; os.replace(name, path); path.chmod(0o600)
+        payload = memoryview(data.encode())
+        os.fchmod(fd, 0o600)
+        while payload:
+            written = os.write(fd, payload)
+            if written <= 0: raise OSError("short state-file write")
+            payload = payload[written:]
+        os.fsync(fd); os.close(fd); fd = -1
+        os.replace(name, path); path.chmod(0o600); _fsync_directory(path.parent)
     finally:
         if fd >= 0: os.close(fd)
         try: Path(name).unlink()
@@ -363,8 +376,100 @@ def read_ledger(path: Path, mission: str) -> list[dict[str, Any]]:
 def append_ledger(path: Path, entry: dict[str, Any]) -> None:
     secure_dir(path.parent); with_path = path
     if os.path.lexists(with_path) and stat.S_ISLNK(with_path.lstat().st_mode): raise ConsultError("INVALID_STATE_PATH", ["ledger cannot be symlinked"])
-    with with_path.open("a", encoding="utf-8") as f:
-        os.chmod(with_path, 0o600); fcntl.flock(f, fcntl.LOCK_EX); f.write(json.dumps(entry, sort_keys=True) + "\n"); f.flush(); os.fsync(f.fileno()); fcntl.flock(f, fcntl.LOCK_UN)
+    with with_path.open("a+", encoding="utf-8") as f:
+        os.chmod(with_path, 0o600); fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            for line in f:
+                try: existing = json.loads(line)
+                except json.JSONDecodeError: raise ConsultError("LEDGER_CORRUPT", ["ledger contains invalid JSON"])
+                if existing.get("execution_id") == entry.get("execution_id"):
+                    raise ConsultError("DUPLICATE_EXECUTION_REPLAY", ["execution_id already exists in ledger"])
+            f.seek(0, os.SEEK_END); f.write(json.dumps(entry, sort_keys=True) + "\n"); f.flush(); os.fsync(f.fileno()); _fsync_directory(with_path.parent)
+        finally: fcntl.flock(f, fcntl.LOCK_UN)
+
+def artifact_path(cache_dir: Path, fingerprint: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint): raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["invalid response artifact fingerprint"])
+    return cache_dir / "responses" / f"{fingerprint}.json"
+
+def identity_from_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    return {"snapshot": entry.get("snapshot"), "bundle": entry.get("normalized_bundle_fingerprint"), "mode": entry.get("mode"), "model": entry.get("model"), "effort": entry.get("reasoning_effort")}
+
+def response_answer_ids(response: dict[str, Any], legacy_ids: list[str]) -> list[str]:
+    if response.get("schema_version") == LEGACY_RESPONSE_SCHEMA:
+        answers = response.get("questions_answered")
+        return list(legacy_ids) if isinstance(answers, list) and len(answers) == len(legacy_ids) else []
+    answers = response.get("question_answers")
+    return [answer.get("id") for answer in answers if isinstance(answer, dict)] if isinstance(answers, list) else []
+
+def response_persistence_sensitive_locations(value: Any, path: str = "$") -> list[str]:
+    hits = secret_locations(value) + private_path_locations(value)
+    if isinstance(value, dict):
+        for key, child in value.items(): hits.extend(response_persistence_sensitive_locations(child, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for index, child in enumerate(value): hits.extend(response_persistence_sensitive_locations(child, f"{path}[{index}]"))
+    elif isinstance(value, str) and re.search(r"(?:^|\s)(?:/home/|/tmp/|/Users/|~(?:/|$))", value):
+        hits.append(path)
+    return sorted(set(hits))
+
+def _response_artifact_record(response: dict[str, Any], identity: dict[str, Any], question_answer_ids: list[str]) -> dict[str, Any]:
+    fingerprint = sha256(response)
+    return {"artifact_schema": RESPONSE_ARTIFACT_SCHEMA, "response_schema_version": response.get("schema_version"), "response_fingerprint": fingerprint, "identity": identity, "question_answer_ids": question_answer_ids, "response": response}
+
+def _read_artifact(path: Path, fingerprint: str, identity: dict[str, Any]) -> dict[str, Any]:
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("artifact is not a private regular file")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["response evidence is missing or unreadable"]) from exc
+    if (not isinstance(value, dict) or value.get("artifact_schema") != RESPONSE_ARTIFACT_SCHEMA or
+            value.get("response_fingerprint") != fingerprint or value.get("identity") != identity or
+            not isinstance(value.get("response"), dict) or sha256(value["response"]) != fingerprint or
+            not isinstance(value.get("question_answer_ids"), list) or
+            value.get("question_answer_ids") != response_answer_ids(value["response"], value["question_answer_ids"])):
+        raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["response evidence fingerprint or identity mismatch"])
+    return value
+
+def persist_response_evidence(cache_dir: Path, response: dict[str, Any], identity: dict[str, Any], question_answer_ids: list[str]) -> dict[str, Any]:
+    if response_persistence_sensitive_locations(response):
+        raise ConsultError("VERDICT_PERSISTENCE_FAILURE", ["validated response contains sensitive material unsuitable for persistence"])
+    if question_answer_ids != response_answer_ids(response, question_answer_ids):
+        raise ConsultError("VERDICT_PERSISTENCE_FAILURE", ["validated response question-answer coverage changed before persistence"])
+    record = _response_artifact_record(response, identity, question_answer_ids)
+    fingerprint = record["response_fingerprint"]; path = artifact_path(cache_dir, fingerprint)
+    if path.exists():
+        _read_artifact(path, fingerprint, identity)
+    else:
+        secure_write(path, json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+        _read_artifact(path, fingerprint, identity)
+    return {"relative_path": f"responses/{fingerprint}.json", "fingerprint": fingerprint, "artifact_schema": RESPONSE_ARTIFACT_SCHEMA}
+
+def read_persisted_response(cache_dir: Path, entry: dict[str, Any]) -> dict[str, Any]:
+    reference = entry.get("response_artifact")
+    if not isinstance(reference, dict): raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["historical verdict has no retained response payload"])
+    fingerprint = reference.get("fingerprint")
+    if (not isinstance(fingerprint, str) or reference.get("artifact_schema") != RESPONSE_ARTIFACT_SCHEMA or
+            reference.get("relative_path") != f"responses/{fingerprint}.json"):
+        raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["invalid response artifact reference"])
+    if entry.get("response_fingerprint") != fingerprint:
+        raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["ledger response fingerprint mismatch"])
+    return _read_artifact(artifact_path(cache_dir, fingerprint), fingerprint, identity_from_entry(entry))
+
+def commit_usable_verdict(ledger: Path, cache_dir: Path, entry: dict[str, Any], response: dict[str, Any], identity: dict[str, Any], question_answer_ids: list[str]) -> dict[str, Any]:
+    """Persist and verify canonical evidence before atomically appending a usable verdict."""
+    reference = persist_response_evidence(cache_dir, response, identity, question_answer_ids)
+    entry.update({"response_artifact": reference, "response_fingerprint": reference["fingerprint"],
+                  "response_schema_version": response.get("schema_version"), "question_answer_coverage": question_answer_ids,
+                  "model_response_validated": True, "validated_model_verdict": response.get("verdict"),
+                  "operational_usability": True})
+    # Re-read before the ledger commit: an entry is never appended as usable
+    # unless a post-rename reader can verify its exact canonical payload.
+    recovered = read_persisted_response(cache_dir, entry)
+    if recovered.get("response") != response: raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["canonical response changed before ledger commit"])
+    append_ledger(ledger, entry)
+    return entry
 
 def acquire_lock(ledger: Path, mission: str):
     secure_dir(ledger.parent); lock = ledger.parent / f".{safe_mission_id(mission)}.lock"; handle = lock.open("a+"); os.chmod(lock, 0o600); fcntl.flock(handle, fcntl.LOCK_EX); return handle
@@ -374,9 +479,25 @@ def cache_key(bundle: dict[str, Any], model: str, effort: str) -> str: return sh
 def base_metrics(status: str, mission: str) -> dict[str, Any]: return {"status": status, "mission_id": mission, "verdict": None, "details": [], "process_attempts": 0, "codex_exec_processes": 0, "superior_sessions": 0, "valid_verdicts": 0, "protocol_failures": 0, "replacement_attempts": 0, "cache_hits": 0, "transport_retries": 0}
 def emit(payload: dict[str, Any], code: int = 0) -> int: print(json.dumps(payload, sort_keys=True)); return code
 
+def evidence_state(cache_dir: Path, entry: dict[str, Any]) -> str:
+    if entry.get("verdict") is None: return "NO_MODEL_VERDICT"
+    if not entry.get("response_artifact"):
+        return "HISTORICAL_VALID_VERDICT_UNUSABLE"
+    try: read_persisted_response(cache_dir, entry)
+    except ConsultError: return "VERDICT_EVIDENCE_UNUSABLE"
+    return "VALID_ADVISORY_VERDICT"
+
+def evidence_reason(state: str | None) -> str | None:
+    return {
+        "HISTORICAL_VALID_VERDICT_UNUSABLE": "response payload not retained by the historical execution",
+        "VERDICT_EVIDENCE_UNUSABLE": "referenced response evidence is missing, unreadable, or corrupt",
+    }.get(state)
+
 def status_report(args: argparse.Namespace) -> dict[str, Any]:
-    entries = read_ledger(Path(args.ledger), args.mission_id); processes = sum(int(e.get("process_attempts", e.get("codex_exec_processes", 0))) for e in entries); verdicts = sum(1 for e in entries if e.get("verdict") is not None and e.get("cache") != "HIT"); failures = sum(1 for e in entries if e.get("protocol_failure")); replacements = sum(1 for e in entries if e.get("replacement_for")); hits = sum(e.get("cache") == "HIT" for e in entries); turns = sum(int(e.get("observed_model_turns", e.get("model_turns_observed", 0))) for e in entries); tools = sum(int(e.get("tool_calls_observed", 0)) for e in entries); retries = sum(int(e.get("transport_retries", e.get("automatic_transport_retries", 0))) for e in entries); last = entries[-1] if entries else {}
-    return {"status": "STATUS", "mission_id": args.mission_id, "version": VERSION, "process_attempts": processes, "valid_verdicts": verdicts, "protocol_failures": failures, "replacement_attempts": replacements, "cache_hits": hits, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": processes, "model_turns_observed": turns, "backend_requests_observed": None, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "sessions_used": processes, "soft_sessions_remaining": max(0, args.soft_budget - verdicts), "hard_sessions_remaining": max(0, args.hard_budget - verdicts), "last_verdict": last.get("verdict"), "exit_statuses": sorted({e.get("detailed_status") for e in entries if e.get("detailed_status")})}
+    entries = read_ledger(Path(args.ledger), args.mission_id); cache_dir = Path(args.cache_dir).expanduser().resolve()
+    processes = sum(int(e.get("process_attempts", e.get("codex_exec_processes", 0))) for e in entries); verdicts = sum(1 for e in entries if e.get("verdict") is not None and e.get("cache") != "HIT"); failures = sum(1 for e in entries if e.get("protocol_failure")); replacements = sum(1 for e in entries if e.get("replacement_for")); hits = sum(e.get("cache") == "HIT" for e in entries); turns = sum(int(e.get("observed_model_turns", e.get("model_turns_observed", 0))) for e in entries); tools = sum(int(e.get("tool_calls_observed", 0)) for e in entries); retries = sum(int(e.get("transport_retries", e.get("automatic_transport_retries", 0))) for e in entries); last = entries[-1] if entries else {}; states = [evidence_state(cache_dir, entry) for entry in entries]
+    usable = sum(state == "VALID_ADVISORY_VERDICT" for state in states); unusable = sum(state in {"HISTORICAL_VALID_VERDICT_UNUSABLE", "VERDICT_EVIDENCE_UNUSABLE"} for state in states); last_state = states[-1] if states else None
+    return {"status": "STATUS", "mission_id": args.mission_id, "version": VERSION, "process_attempts": processes, "valid_verdicts": verdicts, "usable_valid_verdicts": usable, "unusable_valid_verdicts": unusable, "protocol_failures": failures, "replacement_attempts": replacements, "cache_hits": hits, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": processes, "model_turns_observed": turns, "backend_requests_observed": None, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "sessions_used": processes, "soft_sessions_remaining": max(0, args.soft_budget - verdicts), "hard_sessions_remaining": max(0, args.hard_budget - verdicts), "last_verdict": last.get("verdict") if last_state == "VALID_ADVISORY_VERDICT" else None, "last_validated_model_verdict": last.get("validated_model_verdict", last.get("verdict")), "last_operational_status": last_state, "last_operational_reason": evidence_reason(last_state), "exit_statuses": sorted({e.get("detailed_status") for e in entries if e.get("detailed_status")})}
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     state = Path.home() / ".local" / "state" / "codex-senior-consult"; p = argparse.ArgumentParser(description=__doc__)
@@ -385,8 +506,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def build_prompt(bundle: dict[str, Any], model: str, effort: str) -> str:
     mode = bundle["mode"]; return ("You are a bounded, single-pass senior consultant.\nUse only this supplied bundle. Do not use tools, inspect workspace, read files, execute commands, invoke MCP. Do not invoke subagents or other models. Do not ask follow-ups, resume, repair, or request another turn. Return exactly one final JSON object matching the mode contract. The wrapper owns identity metadata; do not reproduce it. Address every question by stable question id. A consultation execution may terminate fail-closed while the mission owner continues locally.\nMode: " + mode + "\nTarget model: " + model + "\nReasoning effort: " + effort + "\nBundle:\n" + json.dumps(bundle, sort_keys=True, ensure_ascii=False))
 
-def make_entry(args: argparse.Namespace, execution_id: str, identity: dict[str, Any], status: str, detailed: str, *, processes: int, turns: int, tools: int, verdict: str | None, replacement_for: str | None, cache: str = "MISS", protocol_failure: bool = False, retries: int = 0, transport: dict[str, Any] | None = None) -> dict[str, Any]:
-    return {"execution_id": execution_id, "timestamp": utc_now(), "mission_id": args.mission_id, "mode": args.mode, "model": args.model, "reasoning_effort": getattr(args, "effective_effort", args.effort), "snapshot": identity["snapshot"], "normalized_bundle_fingerprint": identity["bundle"], "replacement_for": replacement_for, "replacement_authorized": bool(replacement_for), "cache": cache, "process_attempts": processes, "valid_verdicts": int(verdict is not None), "protocol_failure": bool(protocol_failure), "protocol_failures": int(protocol_failure), "replacement_attempts": int(bool(replacement_for)), "observed_model_turns": turns, "codex_exec_processes": processes, "model_turns_observed": turns, "tool_calls_observed": tools, "transport_retries": retries, "automatic_repair_calls": 0, "resume_operations": 0, "follow_up_turns": 0, "detailed_status": detailed, "status": status, "verdict": verdict, "secret_exposure": False, **(transport or {})}
+def make_entry(args: argparse.Namespace, execution_id: str, identity: dict[str, Any], status: str, detailed: str, *, processes: int, turns: int, tools: int, verdict: str | None, replacement_for: str | None, cache: str = "MISS", protocol_failure: bool = False, retries: int = 0, transport: dict[str, Any] | None = None, model_response_validated: bool = False, validated_model_verdict: str | None = None) -> dict[str, Any]:
+    return {"execution_id": execution_id, "timestamp": utc_now(), "mission_id": args.mission_id, "mode": args.mode, "model": args.model, "reasoning_effort": getattr(args, "effective_effort", args.effort), "snapshot": identity["snapshot"], "normalized_bundle_fingerprint": identity["bundle"], "replacement_for": replacement_for, "replacement_authorized": bool(replacement_for), "cache": cache, "process_attempts": processes, "valid_verdicts": int(verdict is not None), "protocol_failure": bool(protocol_failure), "protocol_failures": int(protocol_failure), "replacement_attempts": int(bool(replacement_for)), "observed_model_turns": turns, "codex_exec_processes": processes, "model_turns_observed": turns, "tool_calls_observed": tools, "transport_retries": retries, "automatic_repair_calls": 0, "resume_operations": 0, "follow_up_turns": 0, "detailed_status": detailed, "status": status, "verdict": verdict, "model_response_validated": model_response_validated, "validated_model_verdict": validated_model_verdict, "operational_usability": bool(verdict is not None), "secret_exposure": False, **(transport or {})}
 
 def main(argv: list[str] | None = None) -> int:
     try:
@@ -408,7 +529,8 @@ def main(argv: list[str] | None = None) -> int:
             if replacement_for:
                 prior = next((e for e in entries if e.get("execution_id") == replacement_for), None)
                 if not prior: return emit({**base_metrics("REPLACEMENT_NOT_AUTHORIZED", args.mission_id), "details": ["referenced execution does not exist"]}, 4)
-                if prior.get("verdict") is not None: return emit({**base_metrics("REPLACEMENT_NOT_AUTHORIZED", args.mission_id), "details": ["valid verdict cannot be replaced"]}, 4)
+                if prior.get("verdict") is not None or prior.get("model_response_validated"):
+                    return emit({**base_metrics("REPLACEMENT_NOT_AUTHORIZED", args.mission_id), "details": ["validated model verdict cannot be replaced"]}, 4)
                 if prior.get("replacement_for"): return emit({**base_metrics("REPLACEMENT_NOT_AUTHORIZED", args.mission_id), "details": ["replacement of a replacement is forbidden"]}, 4)
                 if sum(1 for e in entries if e.get("replacement_for")) >= args.replacement_budget or any(e.get("replacement_for") == replacement_for for e in entries): return emit({**base_metrics("REPLACEMENT_NOT_AUTHORIZED", args.mission_id), "details": ["replacement allowance exhausted"]}, 4)
                 for key in ("mode", "model", "reasoning_effort"):
@@ -422,7 +544,13 @@ def main(argv: list[str] | None = None) -> int:
                     errors = validate_response(cached.get("response"), args.mission_id, args.mode, args.model, args.effective_effort, bundle["questions"], bundle["snapshot"]["repository_head"], allow_legacy=args.allow_legacy)
                     if errors: raise ValueError
                 except (OSError, ValueError, json.JSONDecodeError, AttributeError, TypeError): return emit({**base_metrics("CACHE_INVALID", args.mission_id), "details": ["cache entry failed schema or identity validation"]}, 2)
-                eid = str(uuid.uuid4()); append_ledger(ledger, make_entry(args, eid, identity, "CACHE_HIT", "CACHE_HIT", processes=0, turns=0, tools=0, verdict=cached["response"].get("verdict"), replacement_for=None, cache="HIT")); return emit({"status": "CACHE_HIT", "mission_id": args.mission_id, "version": VERSION, "response": cached["response"], "execution_id": eid, "replacement_for": None, "process_attempts": 0, "codex_exec_processes": 0, "superior_sessions": 0, "valid_verdicts": 0, "cache_hits": 1, "verdict": cached["response"].get("verdict")})
+                eid = str(uuid.uuid4()); cached_response = cached["response"]
+                entry = make_entry(args, eid, identity, "CACHE_HIT", "CACHE_HIT", processes=0, turns=0, tools=0, verdict=cached_response.get("verdict"), replacement_for=None, cache="HIT")
+                try:
+                    commit_usable_verdict(ledger, cache_dir, entry, cached_response, identity, question_ids(bundle))
+                except (ConsultError, OSError, ValueError):
+                    return emit({**base_metrics("NO_USABLE_VERDICT", args.mission_id), "detailed_status": "VERDICT_PERSISTENCE_FAILURE", "execution_id": eid, "model_response_validated": True, "validated_model_verdict": cached_response.get("verdict"), "details": ["validated cached response could not be retained"], "cache_hits": 1}, 2)
+                return emit({"status": "CACHE_HIT", "detailed_status": "VALID_ADVISORY_VERDICT", "mission_id": args.mission_id, "version": VERSION, "response": cached_response, "execution_id": eid, "replacement_for": None, "process_attempts": 0, "codex_exec_processes": 0, "superior_sessions": 0, "valid_verdicts": 0, "cache_hits": 1, "verdict": cached_response.get("verdict"), "response_fingerprint": entry["response_fingerprint"]})
             process_budget = args.process_hard_budget if args.process_hard_budget is not None else (args.hard_budget if args.hard_budget != 3 else 4); used = sum(int(e.get("process_attempts", 0)) for e in entries); planned = 1 + args.transport_retries
             if used + planned > process_budget or sum(1 for e in entries if e.get("verdict") is not None) >= args.hard_budget and not replacement_for: return emit({**base_metrics("MISSION_BUDGET_EXCEEDED", args.mission_id), "process_attempts": used, "valid_verdicts": sum(1 for e in entries if e.get("verdict") is not None)}, 4)
             prompt = build_prompt(bundle, args.model, args.effective_effort); total_processes = turns = tools = retries = 0; final = None; detailed = "TRANSPORT_ERROR"; timeout = False; diagnostics: list[str] = []; transport: dict[str, Any] = {}
@@ -443,10 +571,28 @@ def main(argv: list[str] | None = None) -> int:
                     errors = validate_response(final, args.mission_id, args.mode, args.model, args.effective_effort, bundle["questions"], bundle["snapshot"]["repository_head"], allow_legacy=args.allow_legacy)
                     if errors: detailed = "MALFORMED_SUPERIOR_RESPONSE"; diagnostics = errors[:8]; final = None; break
                     detailed = "VALID_ADVISORY_VERDICT"; break
-            eid = str(uuid.uuid4()); verdict = final.get("verdict") if final else None; status = "COMPLETED" if final else "NO_VERDICT_PROTOCOL_FAILURE"; entry = make_entry(args, eid, identity, status, detailed, processes=total_processes, turns=turns, tools=tools, verdict=verdict, replacement_for=replacement_for, retries=retries, protocol_failure=not bool(final), transport=transport); append_ledger(ledger, entry)
-            out = {"status": status, "detailed_status": detailed, "mission_id": args.mission_id, "version": VERSION, "execution_id": eid, "replacement_for": replacement_for, "response": final, "verdict": verdict, "process_attempts": total_processes, "valid_verdicts": int(bool(final)), "protocol_failures": int(not bool(final)), "replacement_attempts": int(bool(replacement_for)), "cache_hits": 0, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": total_processes, "superior_sessions": total_processes, "question_count": len(bundle["questions"]), "reasoning_effort": args.effective_effort, "effort_triggers": args.effort_triggers, "backend_requests_observed": None, "model_turns_observed": turns, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "details": diagnostics, **transport}
-            if final and not args.no_cache: secure_write(cache_path, json.dumps({"schema_version": RESPONSE_SCHEMA, "identity": identity, "response": final}))
-            return emit(out, 0 if final else 2)
+            eid = str(uuid.uuid4()); verdict = final.get("verdict") if final else None
+            if final:
+                entry = make_entry(args, eid, identity, "COMPLETED", "VALID_ADVISORY_VERDICT", processes=total_processes, turns=turns, tools=tools, verdict=verdict, replacement_for=replacement_for, retries=retries, transport=transport)
+                try:
+                    commit_usable_verdict(ledger, cache_dir, entry, final, identity, question_ids(bundle))
+                except (ConsultError, OSError, ValueError):
+                    # A semantically valid model response that cannot be durably
+                    # retained is not an actionable advisory verdict.  Do not leak
+                    # its payload or convert it into a retry/replacement signal.
+                    failed = make_entry(args, eid, identity, "NO_USABLE_VERDICT", "VERDICT_PERSISTENCE_FAILURE", processes=total_processes, turns=turns, tools=tools, verdict=None, replacement_for=replacement_for, retries=retries, transport=transport, model_response_validated=True, validated_model_verdict=verdict)
+                    try: append_ledger(ledger, failed)
+                    except (ConsultError, OSError, ValueError): pass
+                    out = {"status": "NO_USABLE_VERDICT", "detailed_status": "VERDICT_PERSISTENCE_FAILURE", "mission_id": args.mission_id, "version": VERSION, "execution_id": eid, "replacement_for": replacement_for, "response": None, "verdict": None, "model_response_validated": True, "validated_model_verdict": verdict, "operational_usability": False, "process_attempts": total_processes, "valid_verdicts": 0, "protocol_failures": 0, "replacement_attempts": int(bool(replacement_for)), "cache_hits": 0, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": total_processes, "superior_sessions": total_processes, "question_count": len(bundle["questions"]), "reasoning_effort": args.effective_effort, "effort_triggers": args.effort_triggers, "backend_requests_observed": None, "model_turns_observed": turns, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "details": ["validated response could not be durably retained"], **transport}
+                    return emit(out, 2)
+                if not args.no_cache:
+                    try: secure_write(cache_path, json.dumps({"schema_version": RESPONSE_SCHEMA, "identity": identity, "response": final}))
+                    except (ConsultError, OSError): pass
+                out = {"status": "COMPLETED", "detailed_status": "VALID_ADVISORY_VERDICT", "mission_id": args.mission_id, "version": VERSION, "execution_id": eid, "replacement_for": replacement_for, "response": final, "verdict": verdict, "response_fingerprint": entry["response_fingerprint"], "response_artifact": entry["response_artifact"], "operational_usability": True, "process_attempts": total_processes, "valid_verdicts": 1, "protocol_failures": 0, "replacement_attempts": int(bool(replacement_for)), "cache_hits": 0, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": total_processes, "superior_sessions": total_processes, "question_count": len(bundle["questions"]), "reasoning_effort": args.effective_effort, "effort_triggers": args.effort_triggers, "backend_requests_observed": None, "model_turns_observed": turns, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "details": diagnostics, **transport}
+                return emit(out)
+            status = "NO_VERDICT_PROTOCOL_FAILURE"; entry = make_entry(args, eid, identity, status, detailed, processes=total_processes, turns=turns, tools=tools, verdict=None, replacement_for=replacement_for, retries=retries, protocol_failure=True, transport=transport); append_ledger(ledger, entry)
+            out = {"status": status, "detailed_status": detailed, "mission_id": args.mission_id, "version": VERSION, "execution_id": eid, "replacement_for": replacement_for, "response": None, "verdict": None, "process_attempts": total_processes, "valid_verdicts": 0, "protocol_failures": 1, "replacement_attempts": int(bool(replacement_for)), "cache_hits": 0, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": total_processes, "superior_sessions": total_processes, "question_count": len(bundle["questions"]), "reasoning_effort": args.effective_effort, "effort_triggers": args.effort_triggers, "backend_requests_observed": None, "model_turns_observed": turns, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "details": diagnostics, **transport}
+            return emit(out, 2)
         finally: fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
     except ConsultError as exc: return emit({**base_metrics(exc.code, args.mission_id if 'args' in locals() else "unknown"), "details": exc.details}, 2)
     except (OSError, subprocess.SubprocessError) as exc: return emit({"status": "TRANSPORT_ERROR", "details": [str(exc)[:300]], "verdict": None}, 2)

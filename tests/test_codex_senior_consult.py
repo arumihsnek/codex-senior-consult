@@ -7,7 +7,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -845,6 +848,141 @@ class ConsultProductTests(unittest.TestCase):
         out = self.parsed(self.invoke(bundle, payload=payload))
         self.assertEqual(out["status"], "COMPLETED")
         self.assertEqual(out["response"], payload)
+
+    def test_completed_verdict_retains_lossless_canonical_evidence(self):
+        bundle = complete_bundle("durable", "merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v2"}
+        payload = v2_response("merge-gate")
+        out = self.parsed(self.invoke(bundle, payload=payload))
+        self.assertEqual((out["status"], out["detailed_status"]), ("COMPLETED", "VALID_ADVISORY_VERDICT"))
+        entry = json.loads(self.ledger.read_text().splitlines()[-1])
+        self.assertTrue(entry["response_artifact"])
+        self.assertEqual(entry["response_fingerprint"], self.mod.sha256(payload))
+        recovered = self.mod.read_persisted_response(self.cache, entry)
+        self.assertEqual(recovered["response"], payload)
+        self.assertEqual(recovered["question_answer_ids"], ["Q1"])
+        self.assertEqual(stat.S_IMODE((self.cache / entry["response_artifact"]["relative_path"]).stat().st_mode), 0o600)
+
+    def test_missing_or_corrupt_evidence_makes_a_valid_verdict_unusable(self):
+        bundle = complete_bundle("evidence-state", "merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v2"}
+        self.assertEqual(self.invoke(bundle, payload=v2_response("merge-gate")).returncode, 0)
+        entry = json.loads(self.ledger.read_text().splitlines()[-1])
+        artifact = self.cache / entry["response_artifact"]["relative_path"]
+        artifact.write_text('{"corrupt":true}')
+        with self.assertRaisesRegex(self.mod.ConsultError, "VERDICT_EVIDENCE_UNUSABLE"):
+            self.mod.read_persisted_response(self.cache, entry)
+        status = self.parsed(subprocess.run(
+            [sys.executable, str(SCRIPT), "--status", "--mission-id", "evidence-state",
+             "--ledger", str(self.ledger), "--cache-dir", str(self.cache)],
+            text=True, capture_output=True, timeout=10))
+        self.assertEqual(status["usable_valid_verdicts"], 0)
+        self.assertEqual(status["unusable_valid_verdicts"], 1)
+
+    def test_historical_valid_verdict_without_payload_is_explicitly_unusable_and_not_replaceable(self):
+        entry = {
+            "execution_id": "historical-valid", "mission_id": "historical", "verdict": "changes_required",
+            "status": "COMPLETED", "detailed_status": "VALID_ADVISORY_VERDICT", "cache": "MISS",
+            "mode": "merge-gate", "model": "gpt-5.6-sol", "reasoning_effort": "medium",
+            "snapshot": "s", "normalized_bundle_fingerprint": "b", "process_attempts": 1,
+        }
+        self.ledger.write_text(json.dumps(entry) + "\n")
+        status = self.parsed(subprocess.run(
+            [sys.executable, str(SCRIPT), "--status", "--mission-id", "historical",
+             "--ledger", str(self.ledger), "--cache-dir", str(self.cache)],
+            text=True, capture_output=True, timeout=10))
+        self.assertEqual(status["last_operational_status"], "HISTORICAL_VALID_VERDICT_UNUSABLE")
+        self.assertEqual(status["last_operational_reason"], "response payload not retained by the historical execution")
+        self.assertEqual(status["usable_valid_verdicts"], 0)
+        bundle = complete_bundle("historical", "merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v2"}
+        out = self.parsed(self.invoke(bundle, payload=v2_response("merge-gate"),
+                                      extra=["--replacement-for", "historical-valid", "--effort", "medium"]))
+        self.assertEqual(out["status"], "REPLACEMENT_NOT_AUTHORIZED")
+        self.assertEqual(self.counter.read_text(), "0")
+
+    def test_persistence_write_failure_is_not_a_usable_verdict_or_a_retry(self):
+        bundle = complete_bundle("persist-failure", "merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v2"}
+        self.cache.mkdir()
+        (self.cache / "responses").write_text("not a directory")
+        out = self.parsed(self.invoke(bundle, payload=v2_response("merge-gate")))
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_USABLE_VERDICT", "VERDICT_PERSISTENCE_FAILURE"))
+        self.assertIsNone(out["verdict"])
+        self.assertTrue(out["model_response_validated"])
+        self.assertEqual(out["validated_model_verdict"], "accept")
+        self.assertEqual(self.counter.read_text(), "1")
+
+    def test_commit_never_appends_a_usable_ledger_entry_before_evidence(self):
+        payload = v2_response("merge-gate")
+        identity = {"snapshot": "s", "bundle": "b", "mode": "merge-gate", "model": "gpt-5.6-sol", "effort": "low"}
+        args = self.mod.parse_args(["--mode", "merge-gate", "--mission-id", "atomic", "--bundle", "x"])
+        entry = self.mod.make_entry(args, "e-1", identity, "COMPLETED", "VALID_ADVISORY_VERDICT",
+                                    processes=1, turns=1, tools=0, verdict="accept", replacement_for=None)
+        with mock.patch.object(self.mod, "secure_write", side_effect=OSError("write failed")), \
+             mock.patch.object(self.mod, "append_ledger") as append:
+            with self.assertRaises(OSError):
+                self.mod.commit_usable_verdict(self.ledger, self.cache, entry, payload, identity, ["Q1"])
+        append.assert_not_called()
+
+    def test_ledger_append_failure_never_reports_a_committed_usable_verdict(self):
+        payload = v2_response("merge-gate")
+        identity = {"snapshot": "s", "bundle": "b", "mode": "merge-gate", "model": "gpt-5.6-sol", "effort": "low"}
+        args = self.mod.parse_args(["--mode", "merge-gate", "--mission-id", "atomic", "--bundle", "x"])
+        entry = self.mod.make_entry(args, "e-2", identity, "COMPLETED", "VALID_ADVISORY_VERDICT",
+                                    processes=1, turns=1, tools=0, verdict="accept", replacement_for=None)
+        with mock.patch.object(self.mod, "append_ledger", side_effect=OSError("append failed")):
+            with self.assertRaises(OSError):
+                self.mod.commit_usable_verdict(self.ledger, self.cache, entry, payload, identity, ["Q1"])
+        self.assertFalse(self.ledger.exists())
+        self.assertTrue(list((self.cache / "responses").glob("*.json")))
+
+    def test_atomic_artifact_never_exposes_partial_json_to_concurrent_reader(self):
+        artifact = self.cache / "responses" / ("a" * 64 + ".json")
+        data = json.dumps({"payload": "x" * 500_000})
+        observed = []
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                if artifact.exists():
+                    try:
+                        json.loads(artifact.read_text())
+                        observed.append("valid")
+                    except json.JSONDecodeError:
+                        observed.append("partial")
+                time.sleep(0.001)
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        self.mod.secure_write(artifact, data)
+        time.sleep(0.02)
+        stop.set(); thread.join(timeout=2)
+        self.assertTrue(observed)
+        self.assertNotIn("partial", observed)
+
+    def test_interruption_before_atomic_rename_leaves_no_complete_artifact_or_temp_file(self):
+        artifact = self.cache / "responses" / ("b" * 64 + ".json")
+        with mock.patch.object(self.mod.os, "replace", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.mod.secure_write(artifact, '{"response":"complete"}')
+        self.assertFalse(artifact.exists())
+        self.assertEqual(list(artifact.parent.glob(f".{artifact.name}.*")), [])
+
+    def test_duplicate_execution_id_is_rejected_and_sensitive_response_is_not_persisted(self):
+        entry = {"execution_id": "duplicate", "mission_id": "dup"}
+        self.mod.append_ledger(self.ledger, entry)
+        with self.assertRaisesRegex(self.mod.ConsultError, "DUPLICATE_EXECUTION_REPLAY"):
+            self.mod.append_ledger(self.ledger, entry)
+        payload = v2_response("merge-gate")
+        payload["summary"] = "token=sk-abcdefghijklmnopqrstuvwxyz123456"
+        identity = {"snapshot": "s", "bundle": "b", "mode": "merge-gate", "model": "gpt-5.6-sol", "effort": "low"}
+        with self.assertRaisesRegex(self.mod.ConsultError, "VERDICT_PERSISTENCE_FAILURE"):
+            self.mod.persist_response_evidence(self.cache, payload, identity, ["Q1"])
+        self.assertFalse((self.cache / "responses").exists())
+        payload["summary"] = "see /home/ubuntu/private-review-note"
+        with self.assertRaisesRegex(self.mod.ConsultError, "VERDICT_PERSISTENCE_FAILURE"):
+            self.mod.persist_response_evidence(self.cache, payload, identity, ["Q1"])
 
 
 if __name__ == "__main__":
