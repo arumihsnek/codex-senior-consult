@@ -329,6 +329,9 @@ FINDING = {"type": "object", "additionalProperties": False, "required": ["id", "
 CAUSE = {"type": "object", "additionalProperties": False, "required": ["id", "cause", "evidence"], "properties": {"id": STRING, "cause": STRING, "evidence": STRING_LIST}}
 PATH = {"type": "object", "additionalProperties": False, "required": ["id", "action", "rationale"], "properties": {"id": STRING, "action": STRING, "rationale": STRING}}
 RISK = {"type": "object", "additionalProperties": False, "required": ["id", "risk", "impact"], "properties": {"id": STRING, "risk": STRING, "impact": STRING}}
+NON_BLOCKING_OBSERVATION = {"type": "object", "additionalProperties": False,
+    "required": ["id", "claim", "evidence", "reasoning_summary"],
+    "properties": {"id": STRING, "claim": STRING, "evidence": STRING_LIST, "reasoning_summary": STRING}}
 CLAIM = {"type": "object", "additionalProperties": False, "required": ["claim", "classification", "evidence"], "properties": {"claim": STRING, "classification": {"type": "string", "enum": ["supported", "unsupported", "uncertain"]}, "evidence": STRING_LIST}}
 DECISION = {"type": "object", "additionalProperties": False, "required": ["recommendation", "rationale"], "properties": {"recommendation": STRING, "rationale": STRING}}
 PLAN = {"type": "object", "additionalProperties": False, "required": ["steps", "stop_conditions"], "properties": {"steps": STRING_LIST, "stop_conditions": STRING_LIST}}
@@ -345,11 +348,13 @@ MODE_CONTRACTS: dict[str, dict[str, Any]] = {
     "risk-audit": {"verdicts": ("continue", "changes_required", "blocked"), "fields": {"risks": {"type": "array", "items": RISK}, "controls": STRING_LIST, "residual_risks": {"type": "array", "items": RISK}, "next_safe_step": STRING}},
     "final-review": {"verdicts": ("accept", "changes_required", "blocked"), "fields": {"claim_classifications": {"type": "array", "items": CLAIM}, "summary": STRING, "next_safe_step": STRING}},
 }
+V3_MODE_CONTRACTS = json.loads(json.dumps(MODE_CONTRACTS))
+V3_MODE_CONTRACTS["merge-gate"]["fields"]["non_blocking_observations"] = {"type": "array", "items": NON_BLOCKING_OBSERVATION}
 MODE_FIELDS = {mode: ("verdict", *contract["fields"].keys(), "question_answers") for mode, contract in MODE_CONTRACTS.items()}
 TRANSPORT_SCHEMA_ALLOWLIST = {"type", "properties", "required", "additionalProperties", "items", "enum", "description"}
 
 def local_semantic_contract(mode: str = "integrated-review", schema_version: str = RESPONSE_SCHEMA) -> dict[str, Any]:
-    contract = MODE_CONTRACTS[mode]
+    contract = V3_MODE_CONTRACTS[mode] if schema_version == V3_RESPONSE_SCHEMA else MODE_CONTRACTS[mode]
     properties = {"schema_version": {"type": "string", "const": schema_version}, "verdict": {"type": "string", "enum": list(contract["verdicts"])}, "question_answers": {"type": "array", "items": QUESTION_ANSWER}, **contract["fields"]}
     return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "additionalProperties": False, "required": list(properties), "properties": properties}
 
@@ -369,11 +374,11 @@ def _conservative_transport_shape(value: Any) -> Any:
         out["required"] = list(out["properties"])
     return out
 
-def backend_transport_schema(mode: str = "integrated-review") -> dict[str, Any]:
-    return _conservative_transport_shape(local_semantic_contract(mode))
+def backend_transport_schema(mode: str = "integrated-review", schema_version: str = RESPONSE_SCHEMA) -> dict[str, Any]:
+    return _conservative_transport_shape(local_semantic_contract(mode, schema_version))
 
 def response_schema(mission_id: str | None = None, mode: str = "integrated-review", model: str | None = None, effort: str | None = None, execution: int | None = None, snapshot: str | None = None, schema_version: str = RESPONSE_SCHEMA) -> dict[str, Any]:
-    return backend_transport_schema(mode)
+    return backend_transport_schema(mode, schema_version)
 
 def _legacy_errors(value: Any, mission_id: str, mode: str, model: str, effort: str, questions: list[Any], snapshot: str) -> list[str]:
     if not isinstance(value, dict): return ["response must be an object"]
@@ -393,19 +398,24 @@ def _legacy_errors(value: Any, mission_id: str, mode: str, model: str, effort: s
     if set(value) - {"schema_version", "mission_id", "mode", "model", "reasoning_effort", "snapshot", "verdict", "summary", "blocking_findings", "non_blocking_findings", "assumptions", "required_actions", "plan_delta", "evidence_missing", "questions_answered", "next_safe_step", "confidence", "safe_to_merge"}: errors.append("additional property")
     return errors
 
-def validate_response(value: Any, mission_id: str, mode: str, model: str, effort: str, questions: list[Any], snapshot: str, *, allow_legacy: bool = True) -> list[str]:
+def validate_response(value: Any, mission_id: str, mode: str, model: str, effort: str, questions: list[Any], snapshot: str, *, allow_legacy: bool = True, allow_historical: bool = True) -> list[str]:
     if isinstance(value, dict) and value.get("schema_version") == LEGACY_RESPONSE_SCHEMA:
         return _legacy_errors(value, mission_id, mode, model, effort, questions, snapshot) if allow_legacy else ["legacy v1 response requires --legacy-response-v1"]
     if not isinstance(value, dict): return ["response must be an object"]
-    schema = local_semantic_contract(mode=mode); errors = schema_errors(value, schema)
-    if value.get("schema_version") != RESPONSE_SCHEMA: errors.append("schema_version must equal v2")
+    version = value.get("schema_version")
+    if version == RESPONSE_SCHEMA and not allow_historical: return [f"historical response requires explicit compatibility mode; expected {V3_RESPONSE_SCHEMA}"]
+    if version not in {RESPONSE_SCHEMA, V3_RESPONSE_SCHEMA}: return [f"schema_version must equal {V3_RESPONSE_SCHEMA}"]
+    schema = local_semantic_contract(mode=mode, schema_version=version); errors = schema_errors(value, schema)
     expected_ids = [str(q.get("id")) if isinstance(q, dict) else f"Q{i + 1}" for i, q in enumerate(questions)]
     answers = value.get("question_answers", [])
     if isinstance(answers, list):
         ids = [answer.get("id") for answer in answers if isinstance(answer, dict)]
         if len(ids) != len(expected_ids) or set(ids) != set(expected_ids) or len(set(ids)) != len(ids): errors.append("question_answers must contain every supplied question ID exactly once")
     if mode == "merge-gate":
-        if value.get("verdict") == "accept" and (value.get("safe_to_merge") is not True or value.get("blocking_findings") != [] or value.get("required_actions") != []): errors.append("merge-gate accept is inconsistent")
+        if value.get("verdict") == "accept":
+            if value.get("safe_to_merge") is not True: errors.append("MERGE_GATE_ACCEPT_CONTRADICTION /safe_to_merge expected true")
+            if value.get("blocking_findings") != []: errors.append("MERGE_GATE_ACCEPT_CONTRADICTION /blocking_findings expected empty array")
+            if value.get("required_actions") != []: errors.append("MERGE_GATE_ACCEPT_CONTRADICTION /required_actions expected empty array")
         if value.get("verdict") != "accept" and value.get("safe_to_merge") is not False: errors.append("merge-gate non-accept must be unsafe")
         if value.get("verdict") == "changes_required" and not value.get("blocking_findings") and not value.get("required_actions"): errors.append("merge-gate changes_required requires a finding or action")
         if value.get("verdict") == "blocked" and not value.get("blocking_findings"): errors.append("merge-gate blocked requires blocking evidence")
@@ -686,7 +696,7 @@ def status_report(args: argparse.Namespace) -> dict[str, Any]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     state = Path.home() / ".local" / "state" / "codex-senior-consult"; p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mode", choices=sorted(MODES)); p.add_argument("--mission-id", required=True); p.add_argument("--bundle"); p.add_argument("--model", default="gpt-5.6-sol"); p.add_argument("--effort", choices=sorted(EFFORTS), default="low"); p.add_argument("--critical", action="append", choices=sorted(MEDIUM_TRIGGERS), default=[]); p.add_argument("--replacement-for"); p.add_argument("--legacy-response-v1", action="store_true"); p.add_argument("--status", action="store_true"); p.add_argument("--workspace-read"); p.add_argument("--workspace-read-justification"); p.add_argument("--no-cache", action="store_true"); p.add_argument("--refresh", action="store_true"); p.add_argument("--timeout", type=int, default=180); p.add_argument("--transport-retries", type=int, choices=(0, 1), default=0); p.add_argument("--dangerous-yolo", action="store_true"); p.add_argument("--ledger", default=str(state / "ledger.jsonl")); p.add_argument("--cache-dir", default=str(state / "cache")); p.add_argument("--max-bundle-bytes", type=int, default=131072); p.add_argument("--soft-budget", type=int, default=2); p.add_argument("--hard-budget", type=int, default=3); p.add_argument("--process-hard-budget", type=int); p.add_argument("--replacement-budget", type=int, default=1); return p.parse_args(argv)
+    p.add_argument("--mode", choices=sorted(MODES)); p.add_argument("--mission-id", required=True); p.add_argument("--bundle"); p.add_argument("--model", default="gpt-5.6-sol"); p.add_argument("--effort", choices=sorted(EFFORTS), default="low"); p.add_argument("--critical", action="append", choices=sorted(MEDIUM_TRIGGERS), default=[]); p.add_argument("--replacement-for"); p.add_argument("--legacy-response-v1", action="store_true"); p.add_argument("--historical-response-v2", action="store_true"); p.add_argument("--status", action="store_true"); p.add_argument("--workspace-read"); p.add_argument("--workspace-read-justification"); p.add_argument("--no-cache", action="store_true"); p.add_argument("--refresh", action="store_true"); p.add_argument("--timeout", type=int, default=180); p.add_argument("--transport-retries", type=int, choices=(0, 1), default=0); p.add_argument("--dangerous-yolo", action="store_true"); p.add_argument("--ledger", default=str(state / "ledger.jsonl")); p.add_argument("--cache-dir", default=str(state / "cache")); p.add_argument("--max-bundle-bytes", type=int, default=131072); p.add_argument("--soft-budget", type=int, default=2); p.add_argument("--hard-budget", type=int, default=3); p.add_argument("--process-hard-budget", type=int); p.add_argument("--replacement-budget", type=int, default=1); return p.parse_args(argv)
 
 def construction_parser(command: str) -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog=f"codex_senior_consult.py {command}")
@@ -702,7 +712,7 @@ def command_help() -> str:
     return "commands: build-bundle, preflight, consult, status"
 
 def build_prompt(bundle: dict[str, Any], model: str, effort: str) -> str:
-    mode = bundle["mode"]; return ("You are a bounded, single-pass senior consultant.\nUse only this supplied bundle. Do not use tools, inspect workspace, read files, execute commands, invoke MCP. Do not invoke subagents or other models. Do not ask follow-ups, resume, repair, or request another turn. Return exactly one final JSON object matching the mode contract. The wrapper owns identity metadata; do not reproduce it. Address every question by stable question id. A consultation execution may terminate fail-closed while the mission owner continues locally.\nMode: " + mode + "\nTarget model: " + model + "\nReasoning effort: " + effort + "\nBundle:\n" + json.dumps(bundle, sort_keys=True, ensure_ascii=False))
+    mode = bundle["mode"]; return ("You are a bounded, single-pass senior consultant.\nUse only this supplied bundle. Do not use tools, inspect workspace, read files, execute commands, invoke MCP. Do not invoke subagents or other models. Do not ask follow-ups, resume, repair, or request another turn. Return exactly one final JSON object matching the mode contract. The wrapper owns identity metadata; do not reproduce it. Address every question by stable question id. A consultation execution may terminate fail-closed while the mission owner continues locally. For merge-gate: blocking_findings are only facts preventing acceptance; required_actions are only work required before acceptance; non_blocking_observations are optional notes compatible with acceptance; residual_risks are explicitly accepted risks requiring no pre-merge action. Any real blocker or required pre-merge action makes accept invalid.\nMode: " + mode + "\nTarget model: " + model + "\nReasoning effort: " + effort + "\nBundle:\n" + json.dumps(bundle, sort_keys=True, ensure_ascii=False))
 
 def make_entry(args: argparse.Namespace, execution_id: str, identity: dict[str, Any], status: str, detailed: str, *, processes: int, turns: int, tools: int, verdict: str | None, replacement_for: str | None, cache: str = "MISS", protocol_failure: bool = False, retries: int = 0, transport: dict[str, Any] | None = None, model_response_validated: bool = False, validated_model_verdict: str | None = None) -> dict[str, Any]:
     return {"execution_id": execution_id, "timestamp": utc_now(), "mission_id": args.mission_id, "mode": args.mode, "model": args.model, "reasoning_effort": getattr(args, "effective_effort", args.effort), "snapshot": identity["snapshot"], "normalized_bundle_fingerprint": identity["bundle"], "replacement_for": replacement_for, "replacement_authorized": bool(replacement_for), "cache": cache, "process_attempts": processes, "valid_verdicts": int(verdict is not None), "protocol_failure": bool(protocol_failure), "protocol_failures": int(protocol_failure), "replacement_attempts": int(bool(replacement_for)), "observed_model_turns": turns, "codex_exec_processes": processes, "model_turns_observed": turns, "tool_calls_observed": tools, "transport_retries": retries, "automatic_repair_calls": 0, "resume_operations": 0, "follow_up_turns": 0, "detailed_status": detailed, "status": status, "verdict": verdict, "model_response_validated": model_response_validated, "validated_model_verdict": validated_model_verdict, "operational_usability": bool(verdict is not None), "secret_exposure": False, **(transport or {})}
@@ -746,7 +756,7 @@ def main(argv: list[str] | None = None) -> int:
             codes = {d["code"] for d in local_preflight["diagnostics"]}
             status = "SECRET_DETECTED" if "SECRET_DETECTED" in codes else "PRIVATE_PATH_DETECTED" if "PRIVATE_PATH_DETECTED" in codes else "BUNDLE_INCOMPLETE"
             return emit({**base_metrics(status, args.mission_id), "diagnostics": local_preflight["diagnostics"], "details": [d["reason"] for d in local_preflight["diagnostics"]], "model_processes_consumed": 0}, 2)
-        bundle = local_preflight["payload"]; args.effort_triggers = sorted(set(args.critical)); args.effective_effort = "medium" if args.effort in {"low", "medium"} and args.effort_triggers else args.effort; args.allow_legacy = args.legacy_response_v1 or bundle["requested_output"].get("schema_version") == LEGACY_RESPONSE_SCHEMA
+        bundle = local_preflight["payload"]; args.effort_triggers = sorted(set(args.critical)); args.effective_effort = "medium" if args.effort in {"low", "medium"} and args.effort_triggers else args.effort; args.response_schema_version = bundle["requested_output"].get("schema_version"); args.allow_legacy = args.legacy_response_v1 or args.response_schema_version == LEGACY_RESPONSE_SCHEMA; args.allow_historical = args.historical_response_v2 or args.response_schema_version == RESPONSE_SCHEMA
         if not bundle["escalation"].get("justified", True): return emit({**base_metrics("ESCALATION_NOT_JUSTIFIED", args.mission_id), "superior_sessions": 0, "codex_exec_processes": 0}, 0)
         if args.workspace_read: return emit({**base_metrics("WORKSPACE_READ_UNSUPPORTED", args.mission_id), "details": ["workspace access cannot preserve zero tools"]}, 3)
         if args.dangerous_yolo: return emit({**base_metrics("DANGEROUS_YOLO_DISABLED", args.mission_id), "details": ["dangerous bypass is disabled"]}, 3)
@@ -768,8 +778,8 @@ def main(argv: list[str] | None = None) -> int:
             if not replacement_for and not args.no_cache and not args.refresh and os.path.lexists(cache_path):
                 try:
                     info = cache_path.lstat(); cached = json.loads(cache_path.read_text())
-                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or cached.get("schema_version") != RESPONSE_SCHEMA or cached.get("identity") != identity: raise ValueError
-                    errors = validate_response(cached.get("response"), args.mission_id, args.mode, args.model, args.effective_effort, bundle["questions"], bundle["snapshot"]["repository_head"], allow_legacy=args.allow_legacy)
+                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or cached.get("schema_version") != args.response_schema_version or cached.get("identity") != identity: raise ValueError
+                    errors = validate_response(cached.get("response"), args.mission_id, args.mode, args.model, args.effective_effort, bundle["questions"], bundle["snapshot"]["repository_head"], allow_legacy=args.allow_legacy, allow_historical=args.allow_historical)
                     if errors: raise ValueError
                 except (OSError, ValueError, json.JSONDecodeError, AttributeError, TypeError): return emit({**base_metrics("CACHE_INVALID", args.mission_id), "details": ["cache entry failed schema or identity validation"]}, 2)
                 eid = str(uuid.uuid4()); cached_response = cached["response"]
@@ -783,7 +793,7 @@ def main(argv: list[str] | None = None) -> int:
             if used + planned > process_budget or sum(1 for e in entries if e.get("verdict") is not None) >= args.hard_budget and not replacement_for: return emit({**base_metrics("MISSION_BUDGET_EXCEEDED", args.mission_id), "process_attempts": used, "valid_verdicts": sum(1 for e in entries if e.get("verdict") is not None)}, 4)
             prompt = build_prompt(bundle, args.model, args.effective_effort); total_processes = turns = tools = retries = 0; final = None; detailed = "TRANSPORT_ERROR"; timeout = False; diagnostics: list[str] = []; transport: dict[str, Any] = {}
             with tempfile.TemporaryDirectory(prefix="codex-senior-work-") as work, tempfile.TemporaryDirectory(prefix="codex-senior-control-") as ctl:
-                schema_file = Path(ctl) / "schema.json"; output_file = Path(ctl) / "response.json"; secure_write(schema_file, json.dumps(response_schema(mode=args.mode)))
+                schema_file = Path(ctl) / "schema.json"; output_file = Path(ctl) / "response.json"; secure_write(schema_file, json.dumps(response_schema(mode=args.mode, schema_version=args.response_schema_version)))
                 command = ["codex", "--ask-for-approval", "never", "exec", "--ephemeral", "-C", work, "--sandbox", "read-only", "--json", "--output-schema", str(schema_file), "-o", str(output_file), "--ignore-user-config", "--ignore-rules", "-c", "shell_environment_policy.inherit=none", "--skip-git-repo-check", "-m", args.model, "-c", f'model_reasoning_effort="{args.effective_effort}"', "-"]
                 for attempt in range(1 + args.transport_retries):
                     total_processes += 1; rc, stdout, stderr, timeout = run_process(command, prompt, args.timeout, Path(work)); t, tool_count, terminal, diagnostics = count_events(stdout); turns += t; tools += tool_count
@@ -797,7 +807,7 @@ def main(argv: list[str] | None = None) -> int:
                     if diagnostics or tools or turns != 1 or not terminal: detailed = "SINGLE_PASS_CONTRACT_VIOLATION"; break
                     try: final = json.loads(output_file.read_text())
                     except (OSError, json.JSONDecodeError): detailed = "MALFORMED_SUPERIOR_RESPONSE"; break
-                    errors = validate_response(final, args.mission_id, args.mode, args.model, args.effective_effort, bundle["questions"], bundle["snapshot"]["repository_head"], allow_legacy=args.allow_legacy)
+                    errors = validate_response(final, args.mission_id, args.mode, args.model, args.effective_effort, bundle["questions"], bundle["snapshot"]["repository_head"], allow_legacy=args.allow_legacy, allow_historical=args.allow_historical)
                     if errors: detailed = "MALFORMED_SUPERIOR_RESPONSE"; diagnostics = errors[:8]; final = None; break
                     detailed = "VALID_ADVISORY_VERDICT"; break
             eid = str(uuid.uuid4()); verdict = final.get("verdict") if final else None
@@ -815,7 +825,7 @@ def main(argv: list[str] | None = None) -> int:
                     out = {"status": "NO_USABLE_VERDICT", "detailed_status": "VERDICT_PERSISTENCE_FAILURE", "mission_id": args.mission_id, "version": VERSION, "execution_id": eid, "replacement_for": replacement_for, "response": None, "verdict": None, "model_response_validated": True, "validated_model_verdict": verdict, "operational_usability": False, "process_attempts": total_processes, "valid_verdicts": 0, "protocol_failures": 0, "replacement_attempts": int(bool(replacement_for)), "cache_hits": 0, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": total_processes, "superior_sessions": total_processes, "question_count": len(bundle["questions"]), "reasoning_effort": args.effective_effort, "effort_triggers": args.effort_triggers, "backend_requests_observed": None, "model_turns_observed": turns, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "details": ["validated response could not be durably retained"], **transport}
                     return emit(out, 2)
                 if not args.no_cache:
-                    try: secure_write(cache_path, json.dumps({"schema_version": RESPONSE_SCHEMA, "identity": identity, "response": final}))
+                    try: secure_write(cache_path, json.dumps({"schema_version": args.response_schema_version, "identity": identity, "response": final}))
                     except (ConsultError, OSError): pass
                 out = {"status": "COMPLETED", "detailed_status": "VALID_ADVISORY_VERDICT", "mission_id": args.mission_id, "version": VERSION, "execution_id": eid, "replacement_for": replacement_for, "response": final, "verdict": verdict, "response_fingerprint": entry["response_fingerprint"], "response_artifact": entry["response_artifact"], "operational_usability": True, "process_attempts": total_processes, "valid_verdicts": 1, "protocol_failures": 0, "replacement_attempts": int(bool(replacement_for)), "cache_hits": 0, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": total_processes, "superior_sessions": total_processes, "question_count": len(bundle["questions"]), "reasoning_effort": args.effective_effort, "effort_triggers": args.effort_triggers, "backend_requests_observed": None, "model_turns_observed": turns, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "details": diagnostics, **transport}
                 return emit(out)

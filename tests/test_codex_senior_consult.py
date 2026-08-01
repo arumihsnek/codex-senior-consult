@@ -120,6 +120,13 @@ def v2_response(mode, question_ids=("Q1",)):
             **payloads[mode]}
 
 
+def v3_response(mode, question_ids=("Q1",)):
+    payload = v2_response(mode, question_ids)
+    payload["schema_version"] = "codex-senior-consult-response/v3"
+    if mode == "merge-gate": payload["non_blocking_observations"] = []
+    return payload
+
+
 def write_fake_codex(path, payload, *, tool=False, malformed=False, fail_transport=False, stderr_text="transport unavailable", sleep_seconds=0):
     final = "{not-json" if malformed else json.dumps(payload)
     events = [
@@ -989,6 +996,15 @@ class ConsultProductTests(unittest.TestCase):
         with self.assertRaisesRegex(self.mod.ConsultError, "VERDICT_PERSISTENCE_FAILURE"):
             self.mod.persist_response_evidence(self.cache, payload, identity, ["Q1"])
 
+    def test_v3_merge_gate_cli_persists_recoverable_mode_bound_artifact(self):
+        bundle = complete_bundle(mode="merge-gate", questions=[{"id": "Q1", "text": "Safe?"}])
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v3"}
+        proc = self.invoke(bundle, payload=v3_response("merge-gate"))
+        out = self.parsed(proc)
+        self.assertEqual((proc.returncode, out["detailed_status"]), (0, "VALID_ADVISORY_VERDICT"), out)
+        artifact = self.cache / out["response_artifact"]["relative_path"]
+        self.assertEqual(json.loads(artifact.read_text())["response"], v3_response("merge-gate"))
+
 
 class V3ConstructionPreflightTests(unittest.TestCase):
     @classmethod
@@ -1114,6 +1130,39 @@ class V3PrivacyTransportTests(unittest.TestCase):
         self.assertEqual(evidence["malformed_jsonl_events"], 1)
         self.assertEqual(evidence["unknown_event_types"], 1)
         self.assertTrue(evidence["structured_transport_evidence"])
+
+
+class V3ResponseCompatibilityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_module()
+
+    def test_v3_merge_gate_accept_truth_table_has_complete_field_paths(self):
+        finding = {"id": "F1", "claim": "A blocker", "severity": "blocking",
+                   "evidence": ["frozen evidence"], "reasoning_summary": "Prevents merge."}
+        for safe in (False, True):
+            for findings in ([], [finding]):
+                for actions in ([], ["Fix before merge."]):
+                    payload = v3_response("merge-gate")
+                    payload.update(safe_to_merge=safe, blocking_findings=findings, required_actions=actions)
+                    errors = self.mod.validate_response(payload, "m", "merge-gate", "model", "low", [{"id": "Q1"}], "a" * 40, allow_legacy=False, allow_historical=False)
+                    self.assertEqual(not errors, safe and not findings and not actions, errors)
+                    if not safe: self.assertTrue(any("/safe_to_merge" in error for error in errors), errors)
+                    if findings: self.assertTrue(any("/blocking_findings" in error for error in errors), errors)
+                    if actions: self.assertTrue(any("/required_actions" in error for error in errors), errors)
+
+    def test_v3_is_mode_bound_and_observations_are_required_but_may_be_empty(self):
+        payload = v3_response("merge-gate")
+        self.assertEqual(self.mod.validate_response(payload, "m", "merge-gate", "model", "low", [{"id": "Q1"}], "a" * 40, allow_legacy=False, allow_historical=False), [])
+        del payload["non_blocking_observations"]
+        self.assertTrue(self.mod.validate_response(payload, "m", "merge-gate", "model", "low", [{"id": "Q1"}], "a" * 40, allow_legacy=False, allow_historical=False))
+        self.assertTrue(self.mod.validate_response(v3_response("plan"), "m", "merge-gate", "model", "low", [{"id": "Q1"}], "a" * 40, allow_legacy=False, allow_historical=False))
+
+    def test_v2_is_rejected_normally_and_accepted_only_as_historical(self):
+        payload = v2_response("merge-gate")
+        ordinary = self.mod.validate_response(payload, "m", "merge-gate", "model", "low", [{"id": "Q1"}], "a" * 40, allow_legacy=False, allow_historical=False)
+        historical = self.mod.validate_response(payload, "m", "merge-gate", "model", "low", [{"id": "Q1"}], "a" * 40, allow_legacy=False, allow_historical=True)
+        self.assertTrue(ordinary); self.assertEqual(historical, [])
 
 
 if __name__ == "__main__":
