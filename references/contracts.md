@@ -26,7 +26,11 @@ All mode schemas are strict and reject additional properties. Focused contracts 
 }
 ```
 
-Other supported modes use similarly minimal focused fields defined by `response_schema()` in the script. For `merge-gate`, `accept` requires `safe_to_merge: true`, `blocking_findings: []`, and `required_actions: []`; every non-accept verdict requires `safe_to_merge: false`. Contradictions are invalid, not advisory verdicts.
+Every v2 mode also requires `question_answers`, an array of `{ "id": "Q1", "answer": "..." }`. Each normalized bundle question ID must appear exactly once; unknown or duplicate IDs and empty answers are invalid. Question text is not repeated.
+
+The bounded verdict vocabularies are: `merge-gate`, `integrated-review`, `plan-review`, and `final-review`: `accept | changes_required | blocked`; `blocker-analysis`: `continue | human_required | blocked`; `replan`, `plan`, and `risk-audit`: `continue | changes_required | blocked`. For `merge-gate`, `accept` requires `safe_to_merge: true`, `blocking_findings: []`, and `required_actions: []`; every non-accept verdict requires `safe_to_merge: false`. Contradictions are invalid, not advisory verdicts.
+
+All arrays are audited: action and stop-condition arrays contain non-empty strings; findings, causes, paths, risks, and claim classifications have strict small object shapes. `decision` and `plan` are objects in both JSON Schema and local validation; they are never accepted as arbitrary lists. The Codex structured-output endpoint rejects `uniqueItems`, so exact question-ID uniqueness is enforced by the local semantic validator rather than an unsupported schema keyword.
 
 ## v1 transition
 
@@ -34,7 +38,7 @@ Legacy v1 responses that repeat wrapper metadata and question text are accepted 
 
 ## Failure and replacement
 
-`NO_VERDICT_PROTOCOL_FAILURE` is the semantic status for a failed execution. Its `detailed_status` preserves the cause: `MALFORMED_SUPERIOR_RESPONSE`, `SINGLE_PASS_CONTRACT_VIOLATION`, `TRANSPORT_ERROR`, or `TIMEOUT`. No failure is interpreted as `accept`, `changes_required`, or `blocked`.
+`NO_VERDICT_PROTOCOL_FAILURE` is the semantic status for a failed execution. Its `detailed_status` preserves the cause: `MALFORMED_SUPERIOR_RESPONSE`, `SINGLE_PASS_CONTRACT_VIOLATION`, `TRANSPORT_ERROR`, or `TIMEOUT`. A `TRANSPORT_ERROR` retains the process exit code, a bounded redacted stderr summary and fingerprint, and an evidence-based category: `CLI_ARGUMENT_ERROR`, `AUTHENTICATION_ERROR`, `MODEL_UNAVAILABLE`, `RATE_LIMIT_OR_QUOTA`, `NETWORK_OR_SERVICE_ERROR`, or `UNKNOWN_TRANSPORT_ERROR`. No failure is interpreted as `accept`, `changes_required`, or `blocked`.
 
 `--replacement-for EXECUTION_ID` is caller initiated and never automatic. Before transport, the wrapper verifies that the referenced entry exists, has no valid verdict, is not itself a replacement, has no prior replacement, and matches mission, mode, model, effort, snapshot, and normalized bundle fingerprint. The replacement uses a fresh process and the same prompt material. A second replacement, replacement after a valid verdict, changed material, or cache hit is rejected. Transport retries are a separate explicit legacy allowance and are counted; they are not content retries.
 
@@ -46,4 +50,4 @@ Ledger entries identify execution ID, replacement linkage, snapshot identity, no
 
 ## Security model
 
-The child receives a minimal environment, an empty temporary working directory, read-only sandbox configuration, ignored user config/rules, no workspace path, and no copied auth store. Tool-bearing or malformed JSONL fails closed. Timeout kills the process group. The model is instructed not to use tools; the wrapper treats any observed tool event as a contract violation. This reduces but cannot eliminate risks intrinsic to the CLI; do not submit catastrophic-disclosure material.
+The child environment allowlist is exactly `PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TMPDIR`, and `CODEX_HOME` when present, plus the wrapper recursion marker `CODEX_SENIOR_CONSULT_ACTIVE=1`. `CODEX_HOME` is preserved because Codex authentication may live there even when `--ignore-user-config` remains enabled. API keys, provider credentials, authorization headers, and every other parent variable are excluded. The child receives an empty temporary working directory, read-only sandbox configuration, ignored user config/rules, and no workspace path. Tool-bearing or malformed JSONL fails closed. Timeout kills the process group. The model is instructed not to use tools; the wrapper treats any observed tool event as a contract violation. This reduces but cannot eliminate risks intrinsic to the CLI; do not submit catastrophic-disclosure material.

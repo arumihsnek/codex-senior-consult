@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import jsonschema
 import os
 from pathlib import Path
 import stat
@@ -85,7 +86,38 @@ def response(mission_id="mission-1", mode="integrated-review", confidence="high"
     return value
 
 
-def write_fake_codex(path, payload, *, tool=False, malformed=False, fail_transport=False, sleep_seconds=0):
+def v2_response(mode, question_ids=("Q1",)):
+    answers = [{"id": question_id, "answer": "Addressed from the frozen evidence."}
+               for question_id in question_ids]
+    payloads = {
+        "merge-gate": {"verdict": "accept", "safe_to_merge": True,
+                       "blocking_findings": [], "required_actions": [],
+                       "residual_risks": [], "summary": "Safe to merge."},
+        "blocker-analysis": {"verdict": "continue", "ranked_causes": [],
+                             "continuation_paths": [], "recommended_path": "Inspect local evidence.",
+                             "cheapest_discriminating_experiment": "Run the focused check.",
+                             "stop_conditions": [], "next_safe_step": "Run the focused check."},
+        "replan": {"verdict": "continue", "invalidated_assumptions": [], "plan_delta": [],
+                   "closed_phases_preserved": [], "new_stop_conditions": [],
+                   "next_safe_step": "Keep the closed phase."},
+        "integrated-review": {"verdict": "accept", "summary": "Evidence is consistent.",
+                              "findings": [], "decision": {"recommendation": "continue", "rationale": "Evidence supports it."},
+                              "next_safe_step": "Continue locally."},
+        "plan": {"verdict": "continue", "summary": "The bounded plan is sufficient.",
+                 "plan": {"steps": ["Run the focused check."], "stop_conditions": []},
+                 "risks": [], "next_safe_step": "Run the focused check."},
+        "plan-review": {"verdict": "accept", "summary": "The plan is acceptable.",
+                        "blocking_findings": [], "required_actions": [], "next_safe_step": "Execute the plan."},
+        "risk-audit": {"verdict": "continue", "risks": [], "controls": [],
+                       "residual_risks": [], "next_safe_step": "Maintain controls."},
+        "final-review": {"verdict": "accept", "claim_classifications": [],
+                         "summary": "Claims are supported.", "next_safe_step": "Use the merge gate."},
+    }
+    return {"schema_version": "codex-senior-consult-response/v2", "question_answers": answers,
+            **payloads[mode]}
+
+
+def write_fake_codex(path, payload, *, tool=False, malformed=False, fail_transport=False, stderr_text="transport unavailable", sleep_seconds=0):
     final = "{not-json" if malformed else json.dumps(payload)
     events = [
         {"type": "thread.started", "thread_id": "t-1"},
@@ -107,15 +139,16 @@ stdin_counter = pathlib.Path(os.environ['FAKE_STDIN_COUNTER'])
 stdin_counter.write_text(str(int(stdin_counter.read_text() or '0') + 1))
 prompt = sys.stdin.read()
 pathlib.Path(os.environ['FAKE_PROMPT']).write_text(prompt)
+pathlib.Path(%r).write_text(json.dumps(dict(os.environ), sort_keys=True))
 if %r:
-    print('transport unavailable', file=sys.stderr)
+    print(%r, file=sys.stderr)
     raise SystemExit(75)
 events = %r
 for event in events:
     print(json.dumps(event), flush=True)
 out = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])
 out.write_text(%r)
-""" % (sleep_seconds, fail_transport, events, final)
+""" % (sleep_seconds, str(path.parent / "env"), fail_transport, stderr_text, events, final)
     code = code.replace("pathlib.Path(os.environ['FAKE_COUNTER'])", f"pathlib.Path({str(path.parent / 'counter')!r})")
     code = code.replace("pathlib.Path(os.environ['FAKE_ARGV'])", f"pathlib.Path({str(path.parent / 'argv')!r})")
     code = code.replace("pathlib.Path(os.environ['FAKE_STDIN_COUNTER'])", f"pathlib.Path({str(path.parent / 'stdin-counter')!r})")
@@ -154,6 +187,19 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_text(%r)
 
 
 class ConsultProductTests(unittest.TestCase):
+    def test_transport_stderr_is_bounded_and_redacted(self):
+        module = load_module()
+        value = module.sanitize_transport_stderr(
+            "fatal /home/ubuntu/.codex/config.toml sk-abcdefghijklmnopqrstuvwxyz\n"
+            "Bearer abcdefghijklmnop\n"
+            "permission denied /tmp/codex-senior-work-123"
+        )
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", value)
+        self.assertNotIn("Bearer abcdefghijklmnop", value)
+        self.assertNotIn("/home/ubuntu", value)
+        self.assertNotIn("/tmp/codex-senior-work-123", value)
+        self.assertLessEqual(len(value), 1200)
+
     @classmethod
     def setUpClass(cls):
         cls.mod = load_module()
@@ -169,18 +215,31 @@ class ConsultProductTests(unittest.TestCase):
         self.stdin_counter = self.base / "stdin-counter"
         self.prompt = self.base / "prompt"
         self.argv_log = self.base / "argv"
+        self.env_log = self.base / "env"
         self.counter.write_text("0")
         self.stdin_counter.write_text("0")
 
-    def test_response_schema_const_properties_declare_json_types(self):
+    def test_response_schema_declares_only_focused_v2_payload_properties(self):
         schema = self.mod.response_schema("mission-1", "merge-gate", "gpt-5.6-sol", "medium", 1, "a" * 40)
-        for name in ("schema_version", "mission_id", "mode", "model", "reasoning_effort", "snapshot"):
+        for name in ("schema_version", "verdict"):
             self.assertEqual(schema["properties"][name]["type"], "string")
+        self.assertEqual(schema["properties"]["question_answers"]["type"], "array")
+        self.assertNotIn("mission_id", schema["properties"])
 
-    def test_response_schema_requires_exact_snapshot(self):
+    def test_response_schema_does_not_require_wrapper_metadata(self):
         schema = self.mod.response_schema("mission-1", "merge-gate", "gpt-5.6-sol", "medium", 1, "a" * 40)
         self.assertNotIn("snapshot", schema["required"])
-        self.assertEqual(schema["properties"]["snapshot"]["const"], "a" * 40)
+        self.assertNotIn("snapshot", schema["properties"])
+
+    def test_v2_output_schemas_omit_codex_rejected_unique_items_keyword(self):
+        def keys(value):
+            if isinstance(value, dict):
+                return set(value) | set().union(*(keys(child) for child in value.values()))
+            if isinstance(value, list):
+                return set().union(*(keys(child) for child in value)) if value else set()
+            return set()
+        for mode in self.mod.MODES:
+            self.assertNotIn("uniqueItems", keys(self.mod.response_schema(mode=mode)), mode)
 
     def test_validate_response_rejects_snapshot_mismatch(self):
         valid = response(mode="merge-gate", snapshot="a" * 40)
@@ -209,7 +268,7 @@ class ConsultProductTests(unittest.TestCase):
         env.pop("CODEX_SENIOR_CONSULT_ACTIVE", None)
         return env
 
-    def invoke(self, bundle, payload=None, extra=None, **fake_options):
+    def invoke(self, bundle, payload=None, extra=None, child_env=None, **fake_options):
         self.bundle_path.write_text(json.dumps(bundle))
         fake = self.base / "codex"
         write_fake_codex(fake, payload or response(bundle["mission_id"], bundle["mode"]), **fake_options)
@@ -218,7 +277,10 @@ class ConsultProductTests(unittest.TestCase):
                "--ledger", str(self.ledger), "--cache-dir", str(self.cache)]
         if extra:
             cmd.extend(extra)
-        return subprocess.run(cmd, text=True, capture_output=True, env=self.env_for(fake), timeout=10)
+        env = self.env_for(fake)
+        if child_env:
+            env.update(child_env)
+        return subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=10)
 
     def parsed(self, proc):
         return json.loads(proc.stdout)
@@ -248,6 +310,69 @@ class ConsultProductTests(unittest.TestCase):
         argv = json.loads(self.argv_log.read_text())
         self.assertLess(argv.index("--ask-for-approval"), argv.index("exec"))
         self.assertIn("shell_environment_policy.inherit=none", argv)
+
+    def test_cli_contract_binds_requested_model_effective_effort_and_single_output_file(self):
+        payload = response()
+        payload["model"] = "requested-model"
+        payload["reasoning_effort"] = "medium"
+        proc = self.invoke(complete_bundle(), payload=payload, extra=["--model", "requested-model", "--critical", "credentials"],
+                           child_env={"CODEX_HOME": "/isolated/auth-home", "OPENAI_API_KEY": "secret-value",
+                                      "ANTHROPIC_API_KEY": "other-secret", "AUTHORIZATION": "Bearer value"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        argv = json.loads(self.argv_log.read_text())
+        self.assertEqual(argv[argv.index("-m") + 1], "requested-model")
+        self.assertEqual(argv[argv.index("-c", argv.index("-m")) + 1], 'model_reasoning_effort="medium"')
+        self.assertEqual(sum(arg in {"-o", "--output-last-message"} for arg in argv), 1)
+        child = json.loads(self.env_log.read_text())
+        self.assertEqual(child.get("CODEX_HOME"), "/isolated/auth-home")
+        self.assertNotIn("OPENAI_API_KEY", child)
+        self.assertNotIn("ANTHROPIC_API_KEY", child)
+        self.assertNotIn("AUTHORIZATION", child)
+        self.assertTrue(set(child).issubset({"PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "CODEX_HOME", "CODEX_SENIOR_CONSULT_ACTIVE"}))
+
+    def test_transport_failure_retains_sanitized_actionable_diagnostics(self):
+        proc = self.invoke(complete_bundle(), fail_transport=True,
+                           stderr_text="network connection reset token=sk-abcdefghijklmnopqrstuvwxyz123456 /private/project",
+                           child_env={"OPENAI_API_KEY": "sk-abcdefghijklmnopqrstuvwxyz123456"})
+        out = self.parsed(proc)
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "TRANSPORT_ERROR"))
+        self.assertEqual(out["transport_exit_code"], 75)
+        self.assertEqual(out["transport_category"], "NETWORK_OR_SERVICE_ERROR")
+        self.assertTrue(out["stderr_summary"])
+        self.assertNotIn("sk-", out["stderr_summary"])
+        self.assertNotIn("/private/project", out["stderr_summary"])
+        self.assertTrue(out["stderr_fingerprint"])
+
+    def test_every_v2_mode_has_schema_and_local_validator_parity(self):
+        for mode in sorted(self.mod.MODES):
+            payload = v2_response(mode)
+            schema = self.mod.response_schema(mode=mode)
+            validator = jsonschema.Draft202012Validator(schema)
+            checks = {
+                "canonical": payload,
+                "wrong_type": dict(payload, verdict=[]),
+                "extra": dict(payload, unexpected="no"),
+                "missing": {key: value for key, value in payload.items() if key != "verdict"},
+                "invalid_verdict": dict(payload, verdict="not-a-verdict"),
+            }
+            for name, candidate in checks.items():
+                schema_ok = not list(validator.iter_errors(candidate))
+                local_ok = not self.mod.validate_response(candidate, "m", mode, "model", "low",
+                                                           [{"id": "Q1", "text": "Question"}], "a" * 40)
+                self.assertEqual(schema_ok, local_ok, f"{mode} {name}")
+                self.assertEqual(schema_ok, name == "canonical", f"{mode} {name}")
+
+    def test_v2_question_answers_require_exact_unique_known_ids_and_nonempty_answers(self):
+        payload = v2_response("merge-gate", ("Q1", "Q2"))
+        questions = [{"id": "Q1", "text": "One"}, {"id": "Q2", "text": "Two"}]
+        self.assertEqual(self.mod.validate_response(payload, "m", "merge-gate", "model", "low", questions, "a" * 40), [])
+        for answers in (
+            [{"id": "Q1", "answer": "Yes"}],
+            [{"id": "Q1", "answer": "Yes"}, {"id": "Q1", "answer": "Again"}],
+            [{"id": "Q1", "answer": "Yes"}, {"id": "Q3", "answer": "Unknown"}],
+            [{"id": "Q1", "answer": ""}, {"id": "Q2", "answer": "Yes"}],
+        ):
+            self.assertTrue(self.mod.validate_response(dict(payload, question_answers=answers), "m", "merge-gate", "model", "low", questions, "a" * 40))
 
     def test_six_related_questions_are_grouped_into_one_session(self):
         questions = [f"Q{i}: Is risk {i} controlled?" for i in range(1, 7)]
@@ -537,19 +662,8 @@ class ConsultProductTests(unittest.TestCase):
         self.assertEqual((out["status"], out["superior_sessions"]), ("ESCALATION_NOT_JUSTIFIED", 0))
 
     def test_v2_focused_mode_contracts_do_not_require_wrapper_metadata(self):
-        for mode, payload in {
-            "merge-gate": {"verdict": "accept", "safe_to_merge": True,
-                           "blocking_findings": [], "required_actions": [],
-                           "residual_risks": [], "summary": "safe"},
-            "blocker-analysis": {"verdict": "continue", "ranked_causes": [],
-                                 "continuation_paths": [], "recommended_path": "local",
-                                 "cheapest_discriminating_experiment": "inspect",
-                                 "stop_conditions": [], "next_safe_step": "inspect"},
-            "replan": {"verdict": "replan", "invalidated_assumptions": [],
-                       "plan_delta": [], "closed_phases_preserved": [],
-                       "new_stop_conditions": [], "next_safe_step": "inspect"},
-        }.items():
-            payload["schema_version"] = "codex-senior-consult-response/v2"
+        for mode in ("merge-gate", "blocker-analysis", "replan"):
+            payload = v2_response(mode, ())
             self.assertEqual(self.mod.validate_response(payload, "m", mode, "model", "low", [], "x" * 64),
                              [])
 
@@ -614,9 +728,7 @@ class ConsultProductTests(unittest.TestCase):
     def test_v2_merge_gate_cli_uses_focused_response_without_metadata(self):
         bundle = complete_bundle("v2", "merge-gate")
         bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v2"}
-        payload = {"schema_version": "codex-senior-consult-response/v2", "verdict": "accept",
-                   "safe_to_merge": True, "blocking_findings": [], "required_actions": [],
-                   "residual_risks": [], "summary": "safe"}
+        payload = v2_response("merge-gate")
         out = self.parsed(self.invoke(bundle, payload=payload))
         self.assertEqual(out["status"], "COMPLETED")
         self.assertEqual(out["response"], payload)

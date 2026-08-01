@@ -10,7 +10,7 @@ python3 scripts/codex_senior_consult.py --mode merge-gate \
 The target returns only:
 
 ```json
-{"schema_version":"codex-senior-consult-response/v2","verdict":"accept","safe_to_merge":true,"blocking_findings":[],"required_actions":[],"residual_risks":[],"summary":"Evidence supports the merge gate."}
+{"schema_version":"codex-senior-consult-response/v2","verdict":"accept","safe_to_merge":true,"blocking_findings":[],"required_actions":[],"residual_risks":[],"summary":"Evidence supports the merge gate.","question_answers":[{"id":"merge-evidence","answer":"Yes; the supplied evidence supports the gate."}]}
 ```
 
 ## Replacement after no verdict

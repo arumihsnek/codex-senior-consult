@@ -159,24 +159,37 @@ def validate_and_prepare_bundle(bundle: Any, mission_id: str, mode: str) -> dict
 
 def question_ids(bundle: dict[str, Any]) -> list[str]: return [str(q["id"]) for q in bundle["questions"]]
 
-MODE_FIELDS: dict[str, tuple[str, ...]] = {
-    "merge-gate": ("verdict", "safe_to_merge", "blocking_findings", "required_actions", "residual_risks", "summary"),
-    "blocker-analysis": ("verdict", "ranked_causes", "continuation_paths", "recommended_path", "cheapest_discriminating_experiment", "stop_conditions", "next_safe_step"),
-    "replan": ("verdict", "invalidated_assumptions", "plan_delta", "closed_phases_preserved", "new_stop_conditions", "next_safe_step"),
-    "integrated-review": ("verdict", "summary", "findings", "decision", "next_safe_step"),
-    "plan": ("verdict", "summary", "plan", "risks", "next_safe_step"),
-    "plan-review": ("verdict", "summary", "blocking_findings", "required_actions", "next_safe_step"),
-    "risk-audit": ("verdict", "risks", "controls", "residual_risks", "next_safe_step"),
-    "final-review": ("verdict", "claim_classifications", "summary", "next_safe_step"),
+STRING = {"type": "string", "minLength": 1}
+# Codex's structured-output endpoint rejects JSON Schema `uniqueItems`; keep
+# list elements non-empty and enforce cross-item rules locally where required.
+STRING_LIST = {"type": "array", "items": STRING}
+QUESTION_ANSWER = {"type": "object", "additionalProperties": False, "required": ["id", "answer"], "properties": {"id": STRING, "answer": STRING}}
+FINDING = {"type": "object", "additionalProperties": False, "required": ["id", "claim", "severity", "evidence", "reasoning_summary"], "properties": {"id": STRING, "claim": STRING, "severity": {"type": "string", "enum": ["blocking", "non_blocking"]}, "evidence": STRING_LIST, "reasoning_summary": STRING, "required_change": STRING}}
+CAUSE = {"type": "object", "additionalProperties": False, "required": ["id", "cause", "evidence"], "properties": {"id": STRING, "cause": STRING, "evidence": STRING_LIST}}
+PATH = {"type": "object", "additionalProperties": False, "required": ["id", "action", "rationale"], "properties": {"id": STRING, "action": STRING, "rationale": STRING}}
+RISK = {"type": "object", "additionalProperties": False, "required": ["id", "risk", "impact"], "properties": {"id": STRING, "risk": STRING, "impact": STRING, "control": STRING}}
+CLAIM = {"type": "object", "additionalProperties": False, "required": ["claim", "classification", "evidence"], "properties": {"claim": STRING, "classification": {"type": "string", "enum": ["supported", "unsupported", "uncertain"]}, "evidence": STRING_LIST}}
+DECISION = {"type": "object", "additionalProperties": False, "required": ["recommendation", "rationale"], "properties": {"recommendation": STRING, "rationale": STRING}}
+PLAN = {"type": "object", "additionalProperties": False, "required": ["steps", "stop_conditions"], "properties": {"steps": STRING_LIST, "stop_conditions": STRING_LIST}}
+
+# This is the authoritative v2 contract.  Both emitted JSON Schema and the
+# local semantic validator below derive their structural rules from it.
+MODE_CONTRACTS: dict[str, dict[str, Any]] = {
+    "merge-gate": {"verdicts": ("accept", "changes_required", "blocked"), "fields": {"safe_to_merge": {"type": "boolean"}, "blocking_findings": {"type": "array", "items": FINDING}, "required_actions": STRING_LIST, "residual_risks": {"type": "array", "items": RISK}, "summary": STRING}},
+    "blocker-analysis": {"verdicts": ("continue", "human_required", "blocked"), "fields": {"ranked_causes": {"type": "array", "items": CAUSE}, "continuation_paths": {"type": "array", "items": PATH}, "recommended_path": STRING, "cheapest_discriminating_experiment": STRING, "stop_conditions": STRING_LIST, "next_safe_step": STRING}},
+    "replan": {"verdicts": ("continue", "changes_required", "blocked"), "fields": {"invalidated_assumptions": STRING_LIST, "plan_delta": STRING_LIST, "closed_phases_preserved": STRING_LIST, "new_stop_conditions": STRING_LIST, "next_safe_step": STRING}},
+    "integrated-review": {"verdicts": ("accept", "changes_required", "blocked"), "fields": {"summary": STRING, "findings": {"type": "array", "items": FINDING}, "decision": DECISION, "next_safe_step": STRING}},
+    "plan": {"verdicts": ("continue", "changes_required", "blocked"), "fields": {"summary": STRING, "plan": PLAN, "risks": {"type": "array", "items": RISK}, "next_safe_step": STRING}},
+    "plan-review": {"verdicts": ("accept", "changes_required", "blocked"), "fields": {"summary": STRING, "blocking_findings": {"type": "array", "items": FINDING}, "required_actions": STRING_LIST, "next_safe_step": STRING}},
+    "risk-audit": {"verdicts": ("continue", "changes_required", "blocked"), "fields": {"risks": {"type": "array", "items": RISK}, "controls": STRING_LIST, "residual_risks": {"type": "array", "items": RISK}, "next_safe_step": STRING}},
+    "final-review": {"verdicts": ("accept", "changes_required", "blocked"), "fields": {"claim_classifications": {"type": "array", "items": CLAIM}, "summary": STRING, "next_safe_step": STRING}},
 }
+MODE_FIELDS = {mode: ("verdict", *contract["fields"].keys(), "question_answers") for mode, contract in MODE_CONTRACTS.items()}
 
 def response_schema(mission_id: str | None = None, mode: str = "integrated-review", model: str | None = None, effort: str | None = None, execution: int | None = None, snapshot: str | None = None, schema_version: str = RESPONSE_SCHEMA) -> dict[str, Any]:
-    fields = MODE_FIELDS.get(mode, MODE_FIELDS["integrated-review"])
-    properties = {"schema_version": {"type": "string", "const": schema_version}, **{name: {"type": "object" if name in {"decision", "plan"} else "array" if name.endswith("s") or name in {"findings", "risks", "controls", "blocking_findings", "required_actions", "residual_risks", "claim_classifications", "invalidated_assumptions", "plan_delta", "closed_phases_preserved", "new_stop_conditions", "ranked_causes", "continuation_paths", "stop_conditions"} else "boolean" if name == "safe_to_merge" else "string"} for name in fields}}
-    if mission_id is not None:
-        properties.update({"mission_id": {"type": "string", "const": mission_id}, "mode": {"type": "string", "const": mode}, "model": {"type": "string", "const": model}, "reasoning_effort": {"type": "string", "const": effort}, "snapshot": {"type": "string", "const": snapshot}})
-        properties["schema_version"] = {"type": "string", "const": schema_version}
-    return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "additionalProperties": False, "required": ["schema_version", *fields], "properties": properties}
+    contract = MODE_CONTRACTS[mode]
+    properties = {"schema_version": {"type": "string", "const": schema_version}, "verdict": {"type": "string", "enum": list(contract["verdicts"])}, "question_answers": {"type": "array", "items": QUESTION_ANSWER}, **contract["fields"]}
+    return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "additionalProperties": False, "required": list(properties), "properties": properties}
 
 def _legacy_errors(value: Any, mission_id: str, mode: str, model: str, effort: str, questions: list[Any], snapshot: str) -> list[str]:
     if not isinstance(value, dict): return ["response must be an object"]
@@ -200,17 +213,36 @@ def validate_response(value: Any, mission_id: str, mode: str, model: str, effort
     if isinstance(value, dict) and value.get("schema_version") == LEGACY_RESPONSE_SCHEMA:
         return _legacy_errors(value, mission_id, mode, model, effort, questions, snapshot) if allow_legacy else ["legacy v1 response requires --legacy-response-v1"]
     if not isinstance(value, dict): return ["response must be an object"]
-    fields = MODE_FIELDS.get(mode, MODE_FIELDS["integrated-review"]); errors = []
+    schema = response_schema(mode=mode); errors = schema_errors(value, schema)
     if value.get("schema_version") != RESPONSE_SCHEMA: errors.append("schema_version must equal v2")
-    if set(value) - {"schema_version", *fields}: errors.append("additional property")
-    for field in fields:
-        if field not in value: errors.append(f"missing {field}")
-        elif field == "safe_to_merge" and not isinstance(value[field], bool): errors.append("safe_to_merge must be boolean")
-        elif field != "safe_to_merge" and not isinstance(value[field], str if field in {"verdict", "recommended_path", "cheapest_discriminating_experiment", "next_safe_step", "summary"} else list): errors.append(f"{field} has invalid type")
+    expected_ids = [str(q.get("id")) if isinstance(q, dict) else f"Q{i + 1}" for i, q in enumerate(questions)]
+    answers = value.get("question_answers", [])
+    if isinstance(answers, list):
+        ids = [answer.get("id") for answer in answers if isinstance(answer, dict)]
+        if len(ids) != len(expected_ids) or set(ids) != set(expected_ids) or len(set(ids)) != len(ids): errors.append("question_answers must contain every supplied question ID exactly once")
     if mode == "merge-gate":
-        if value.get("verdict") not in {"accept", "changes_required", "blocked"}: errors.append("invalid verdict")
         if value.get("verdict") == "accept" and (value.get("safe_to_merge") is not True or value.get("blocking_findings") != [] or value.get("required_actions") != []): errors.append("merge-gate accept is inconsistent")
         if value.get("verdict") != "accept" and value.get("safe_to_merge") is not False: errors.append("merge-gate non-accept must be unsafe")
+    return errors
+
+def schema_errors(value: Any, schema: dict[str, Any], path: str = "$") -> list[str]:
+    errors: list[str] = []; typ = schema.get("type")
+    expected = {"object": dict, "array": list, "string": str, "boolean": bool}
+    if typ and (not isinstance(value, expected[typ]) or typ == "boolean" and not isinstance(value, bool)):
+        return [f"{path} has invalid type"]
+    if typ == "string":
+        if len(value) < schema.get("minLength", 0): errors.append(f"{path} must be non-empty")
+        if "enum" in schema and value not in schema["enum"]: errors.append(f"{path} invalid verdict")
+    if typ == "array":
+        if len(value) < schema.get("minItems", 0): errors.append(f"{path} has too few items")
+        if schema.get("uniqueItems") and len({json.dumps(item, sort_keys=True) for item in value}) != len(value): errors.append(f"{path} has duplicate items")
+        for index, item in enumerate(value): errors.extend(schema_errors(item, schema.get("items", {}), f"{path}[{index}]"))
+    if typ == "object":
+        properties = schema.get("properties", {}); missing = set(schema.get("required", ())) - set(value)
+        errors.extend(f"missing {path}.{key}" for key in sorted(missing))
+        if schema.get("additionalProperties") is False: errors.extend(f"additional property {path}.{key}" for key in sorted(set(value) - set(properties)))
+        for key, child in value.items():
+            if key in properties: errors.extend(schema_errors(child, properties[key], f"{path}.{key}"))
     return errors
 
 def count_events(stdout: str) -> tuple[int, int, bool, list[str]]:
@@ -230,7 +262,41 @@ def count_events(stdout: str) -> tuple[int, int, bool, list[str]]:
     return turns, len(seen_tools), terminal, diagnostics
 
 def child_environment() -> dict[str, str]:
-    keep = {"PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR"}; env = {k: v for k, v in os.environ.items() if k in keep}; env["CODEX_SENIOR_CONSULT_ACTIVE"] = "1"; return env
+    # CODEX_HOME is deliberately the only authentication-bearing location that
+    # survives.  The CLI documents that --ignore-user-config still uses it for
+    # authentication; credentials and provider variables never cross this boundary.
+    keep = {"PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "CODEX_HOME"}
+    env = {k: v for k, v in os.environ.items() if k in keep}
+    env["CODEX_SENIOR_CONSULT_ACTIVE"] = "1"
+    return env
+
+def sanitize_stderr(stderr: str, limit: int = 400) -> str:
+    value = stderr
+    for pattern in SECRET_PATTERNS: value = pattern.sub("[REDACTED]", value)
+    value = re.sub(r"(?i)\b(authorization|password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret)\s*[:=]\s*[^\s]+", r"\1=[REDACTED]", value)
+    value = re.sub(r"(?i)\bBearer\s+[^\s]+", "Bearer [REDACTED]", value)
+    value = re.sub(r"(?<![A-Za-z0-9_.-])/(?:[^\s'\"]+)", "[PRIVATE_PATH]", value)
+    return " ".join(value.split())[:limit]
+
+def classify_transport_failure(stderr: str) -> str:
+    text = stderr.casefold()
+    categories = (
+        ("CLI_ARGUMENT_ERROR", ("unknown option", "unrecognized option", "unexpected argument", "cannot be used multiple times", "invalid value for", "requires a value")),
+        ("AUTHENTICATION_ERROR", ("not logged in", "authentication", "login required", "unauthorized", "forbidden", "401", "403")),
+        ("MODEL_UNAVAILABLE", ("model unavailable", "model not found", "unknown model", "does not exist")),
+        ("RATE_LIMIT_OR_QUOTA", ("rate limit", "quota", "too many requests", "429")),
+        ("NETWORK_OR_SERVICE_ERROR", ("network", "connection", "connect", "dns", "service unavailable", "gateway", "timed out", "timeout", "502", "503", "504")),
+    )
+    return next((category for category, evidence in categories if any(marker in text for marker in evidence)), "UNKNOWN_TRANSPORT_ERROR")
+
+def sanitize_transport_stderr(stderr: str) -> str:
+    """Retain bounded transport diagnostics without exposing secrets or paths."""
+    value = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stderr or "")
+    for pattern in SECRET_PATTERNS:
+        value = pattern.sub("[REDACTED]", value)
+    value = re.sub(r"(?<![A-Za-z0-9])(?:/home/[^\s]+|/tmp/[^\s]+)", "<path>", value)
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    return " | ".join(lines[-8:])[:1200]
 
 def run_process(command: list[str], prompt: str, timeout: int, cwd: Path) -> tuple[int, str, str, bool]:
     proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, env=child_environment(), start_new_session=True)
@@ -275,8 +341,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def build_prompt(bundle: dict[str, Any], model: str, effort: str) -> str:
     mode = bundle["mode"]; return ("You are a bounded, single-pass senior consultant.\nUse only this supplied bundle. Do not use tools, inspect workspace, read files, execute commands, invoke MCP. Do not invoke subagents or other models. Do not ask follow-ups, resume, repair, or request another turn. Return exactly one final JSON object matching the mode contract. The wrapper owns identity metadata; do not reproduce it. Address every question by stable question id. A consultation execution may terminate fail-closed while the mission owner continues locally.\nMode: " + mode + "\nTarget model: " + model + "\nReasoning effort: " + effort + "\nBundle:\n" + json.dumps(bundle, sort_keys=True, ensure_ascii=False))
 
-def make_entry(args: argparse.Namespace, execution_id: str, identity: dict[str, Any], status: str, detailed: str, *, processes: int, turns: int, tools: int, verdict: str | None, replacement_for: str | None, cache: str = "MISS", protocol_failure: bool = False, retries: int = 0) -> dict[str, Any]:
-    return {"execution_id": execution_id, "timestamp": utc_now(), "mission_id": args.mission_id, "mode": args.mode, "model": args.model, "reasoning_effort": getattr(args, "effective_effort", args.effort), "snapshot": identity["snapshot"], "normalized_bundle_fingerprint": identity["bundle"], "replacement_for": replacement_for, "replacement_authorized": bool(replacement_for), "cache": cache, "process_attempts": processes, "valid_verdicts": int(verdict is not None), "protocol_failure": bool(protocol_failure), "protocol_failures": int(protocol_failure), "replacement_attempts": int(bool(replacement_for)), "observed_model_turns": turns, "codex_exec_processes": processes, "model_turns_observed": turns, "tool_calls_observed": tools, "transport_retries": retries, "automatic_repair_calls": 0, "resume_operations": 0, "follow_up_turns": 0, "detailed_status": detailed, "status": status, "verdict": verdict, "secret_exposure": False}
+def make_entry(args: argparse.Namespace, execution_id: str, identity: dict[str, Any], status: str, detailed: str, *, processes: int, turns: int, tools: int, verdict: str | None, replacement_for: str | None, cache: str = "MISS", protocol_failure: bool = False, retries: int = 0, transport: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {"execution_id": execution_id, "timestamp": utc_now(), "mission_id": args.mission_id, "mode": args.mode, "model": args.model, "reasoning_effort": getattr(args, "effective_effort", args.effort), "snapshot": identity["snapshot"], "normalized_bundle_fingerprint": identity["bundle"], "replacement_for": replacement_for, "replacement_authorized": bool(replacement_for), "cache": cache, "process_attempts": processes, "valid_verdicts": int(verdict is not None), "protocol_failure": bool(protocol_failure), "protocol_failures": int(protocol_failure), "replacement_attempts": int(bool(replacement_for)), "observed_model_turns": turns, "codex_exec_processes": processes, "model_turns_observed": turns, "tool_calls_observed": tools, "transport_retries": retries, "automatic_repair_calls": 0, "resume_operations": 0, "follow_up_turns": 0, "detailed_status": detailed, "status": status, "verdict": verdict, "secret_exposure": False, **(transport or {})}
 
 def main(argv: list[str] | None = None) -> int:
     try:
@@ -315,22 +381,26 @@ def main(argv: list[str] | None = None) -> int:
                 eid = str(uuid.uuid4()); append_ledger(ledger, make_entry(args, eid, identity, "CACHE_HIT", "CACHE_HIT", processes=0, turns=0, tools=0, verdict=cached["response"].get("verdict"), replacement_for=None, cache="HIT")); return emit({"status": "CACHE_HIT", "mission_id": args.mission_id, "version": VERSION, "response": cached["response"], "execution_id": eid, "replacement_for": None, "process_attempts": 0, "codex_exec_processes": 0, "superior_sessions": 0, "valid_verdicts": 0, "cache_hits": 1, "verdict": cached["response"].get("verdict")})
             process_budget = args.process_hard_budget if args.process_hard_budget is not None else (args.hard_budget if args.hard_budget != 3 else 4); used = sum(int(e.get("process_attempts", 0)) for e in entries); planned = 1 + args.transport_retries
             if used + planned > process_budget or sum(1 for e in entries if e.get("verdict") is not None) >= args.hard_budget and not replacement_for: return emit({**base_metrics("MISSION_BUDGET_EXCEEDED", args.mission_id), "process_attempts": used, "valid_verdicts": sum(1 for e in entries if e.get("verdict") is not None)}, 4)
-            prompt = build_prompt(bundle, args.model, args.effective_effort); total_processes = turns = tools = retries = 0; final = None; detailed = "TRANSPORT_ERROR"; timeout = False; diagnostics: list[str] = []
+            prompt = build_prompt(bundle, args.model, args.effective_effort); total_processes = turns = tools = retries = 0; final = None; detailed = "TRANSPORT_ERROR"; timeout = False; diagnostics: list[str] = []; transport: dict[str, Any] = {}
             with tempfile.TemporaryDirectory(prefix="codex-senior-work-") as work, tempfile.TemporaryDirectory(prefix="codex-senior-control-") as ctl:
                 schema_file = Path(ctl) / "schema.json"; output_file = Path(ctl) / "response.json"; secure_write(schema_file, json.dumps(response_schema(mode=args.mode)))
-                command = ["codex", "--ask-for-approval", "never", "exec", "--ephemeral", "-C", work, "--sandbox", "read-only", "--json", "--output-schema", str(schema_file), "--output-last-message", str(output_file), "-o", str(output_file), "--ignore-user-config", "--ignore-rules", "-c", "shell_environment_policy.inherit=none", "--skip-git-repo-check", "-"]
+                command = ["codex", "--ask-for-approval", "never", "exec", "--ephemeral", "-C", work, "--sandbox", "read-only", "--json", "--output-schema", str(schema_file), "-o", str(output_file), "--ignore-user-config", "--ignore-rules", "-c", "shell_environment_policy.inherit=none", "--skip-git-repo-check", "-m", args.model, "-c", f'model_reasoning_effort="{args.effective_effort}"', "-"]
                 for attempt in range(1 + args.transport_retries):
                     total_processes += 1; rc, stdout, stderr, timeout = run_process(command, prompt, args.timeout, Path(work)); t, tool_count, terminal, diagnostics = count_events(stdout); turns += t; tools += tool_count
                     if timeout: detailed = "TIMEOUT"; break
-                    if rc != 0: detailed = "TRANSPORT_ERROR"; retries += int(attempt < args.transport_retries); continue
+                    if rc != 0:
+                        detailed = "TRANSPORT_ERROR"
+                        transport = {"transport_exit_code": rc, "transport_category": classify_transport_failure(stderr), "stderr_summary": sanitize_stderr(stderr), "stderr_fingerprint": hashlib.sha256(stderr.encode()).hexdigest()}
+                        retries += int(attempt < args.transport_retries)
+                        continue
                     if diagnostics or tools or turns != 1 or not terminal: detailed = "SINGLE_PASS_CONTRACT_VIOLATION"; break
                     try: final = json.loads(output_file.read_text())
                     except (OSError, json.JSONDecodeError): detailed = "MALFORMED_SUPERIOR_RESPONSE"; break
                     errors = validate_response(final, args.mission_id, args.mode, args.model, args.effective_effort, bundle["questions"], bundle["snapshot"]["repository_head"], allow_legacy=args.allow_legacy)
                     if errors: detailed = "MALFORMED_SUPERIOR_RESPONSE"; diagnostics = errors[:8]; final = None; break
                     detailed = "VALID_ADVISORY_VERDICT"; break
-            eid = str(uuid.uuid4()); verdict = final.get("verdict") if final else None; status = "COMPLETED" if final else "NO_VERDICT_PROTOCOL_FAILURE"; entry = make_entry(args, eid, identity, status, detailed, processes=total_processes, turns=turns, tools=tools, verdict=verdict, replacement_for=replacement_for, retries=retries, protocol_failure=not bool(final)); append_ledger(ledger, entry)
-            out = {"status": status, "detailed_status": detailed, "mission_id": args.mission_id, "version": VERSION, "execution_id": eid, "replacement_for": replacement_for, "response": final, "verdict": verdict, "process_attempts": total_processes, "valid_verdicts": int(bool(final)), "protocol_failures": int(not bool(final)), "replacement_attempts": int(bool(replacement_for)), "cache_hits": 0, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": total_processes, "superior_sessions": total_processes, "question_count": len(bundle["questions"]), "reasoning_effort": args.effective_effort, "effort_triggers": args.effort_triggers, "backend_requests_observed": None, "model_turns_observed": turns, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "details": diagnostics}
+            eid = str(uuid.uuid4()); verdict = final.get("verdict") if final else None; status = "COMPLETED" if final else "NO_VERDICT_PROTOCOL_FAILURE"; entry = make_entry(args, eid, identity, status, detailed, processes=total_processes, turns=turns, tools=tools, verdict=verdict, replacement_for=replacement_for, retries=retries, protocol_failure=not bool(final), transport=transport); append_ledger(ledger, entry)
+            out = {"status": status, "detailed_status": detailed, "mission_id": args.mission_id, "version": VERSION, "execution_id": eid, "replacement_for": replacement_for, "response": final, "verdict": verdict, "process_attempts": total_processes, "valid_verdicts": int(bool(final)), "protocol_failures": int(not bool(final)), "replacement_attempts": int(bool(replacement_for)), "cache_hits": 0, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": total_processes, "superior_sessions": total_processes, "question_count": len(bundle["questions"]), "reasoning_effort": args.effective_effort, "effort_triggers": args.effort_triggers, "backend_requests_observed": None, "model_turns_observed": turns, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "details": diagnostics, **transport}
             if final and not args.no_cache: secure_write(cache_path, json.dumps({"schema_version": RESPONSE_SCHEMA, "identity": identity, "response": final}))
             return emit(out, 0 if final else 2)
         finally: fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
