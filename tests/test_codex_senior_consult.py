@@ -457,11 +457,12 @@ class ConsultProductTests(unittest.TestCase):
         out = self.parsed(proc)
         self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "TRANSPORT_ERROR"))
         self.assertEqual(out["transport_exit_code"], 75)
-        self.assertEqual(out["transport_category"], "NETWORK_OR_SERVICE_ERROR")
-        self.assertTrue(out["stderr_summary"])
-        self.assertNotIn("sk-", out["stderr_summary"])
-        self.assertNotIn("/private/project", out["stderr_summary"])
-        self.assertTrue(out["stderr_fingerprint"])
+        self.assertEqual(out["transport_category"], "NETWORK_OR_SERVICE_FAILURE")
+        self.assertTrue(out["transport_evidence"])
+        self.assertNotIn("sk-", json.dumps(out["transport_evidence"]))
+        self.assertNotIn("/private/project", json.dumps(out["transport_evidence"]))
+        self.assertTrue(out["diagnostic_fingerprint"])
+        self.assertNotIn("stderr_summary", out)
 
     def test_every_v2_mode_has_schema_and_local_validator_parity(self):
         for mode in sorted(self.mod.MODES):
@@ -1066,6 +1067,53 @@ class V3ConstructionPreflightTests(unittest.TestCase):
         self.assertEqual(result["model_processes_consumed"], 0)
         self.assertNotIn("caller_required", result["payload"])
         self.assertRegex(result["normalized"]["bundle_fingerprint"], r"^[0-9a-f]{64}$")
+
+
+class V3PrivacyTransportTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_module()
+
+    def test_structural_privacy_accepts_metadata_and_digests(self):
+        value = {"secrets_added": False, "secret_scope_behavior": "fail-closed",
+                 "authentication_reviewed": True, "sha256": "a" * 64,
+                 "repository_head": "b" * 40}
+        self.assertEqual(self.mod.privacy_findings(value), [])
+
+    def test_structural_privacy_rejects_credentials_without_echoing_values(self):
+        secret = "sk-abcdefghijklmnopqrstuvwxyz123456"
+        private = "-----BEGIN PRIVATE KEY-----"
+        findings = self.mod.privacy_findings({"api_key": secret, "private_key": private,
+                                             "auth_material": "QWxhZGRpbjpvcGVuIHNlc2FtZQ123456789"})
+        self.assertEqual({f["path"] for f in findings}, {"/api_key", "/private_key", "/auth_material"})
+        rendered = json.dumps(findings)
+        self.assertNotIn(secret, rendered); self.assertNotIn(private, rendered)
+        self.assertTrue(all(set(f) == {"path", "category"} for f in findings))
+
+    def test_transport_classification_matrix_and_sanitize_first_evidence(self):
+        cases = [
+            ("", "unknown option --bad", 2, False, "CLI_ARGUMENT_FAILURE"),
+            ('{"type":"error","error":{"code":"unauthorized","message":"token sk-abcdefghijklmnopqrstuvwxyz123456"}}', "", 1, False, "AUTHENTICATION_FAILURE"),
+            ('{"type":"error","error":{"code":"model_not_found","message":"missing"}}', "", 1, False, "MODEL_UNAVAILABLE"),
+            ('{"type":"error","error":{"code":"rate_limit_exceeded","message":"429"}}', "", 1, False, "QUOTA_OR_RATE_LIMIT"),
+            ('{"type":"error","error":{"code":"invalid_json_schema","message":"bad"}}', "", 1, False, "SCHEMA_OR_REQUEST_REJECTION"),
+            ('{"type":"error","error":{"code":"safety_policy","message":"blocked"}}', "", 1, False, "SAFETY_OR_POLICY_REJECTION"),
+            ("", "connection reset", 75, False, "NETWORK_OR_SERVICE_FAILURE"),
+            ("", "timeout", 124, True, "PROCESS_TIMEOUT"),
+            ("", "", 9, False, "PROCESS_EXIT_WITHOUT_STRUCTURED_EVIDENCE"),
+            ('{"type":"error","error":{"code":"novel_failure","message":"odd"}}', "", 1, False, "UNKNOWN_TRANSPORT_ERROR"),
+        ]
+        for stdout, stderr, code, timed_out, expected in cases:
+            evidence = self.mod.parse_transport_evidence(stdout, stderr, code, timed_out)
+            self.assertEqual(evidence["transport_category"], expected, evidence)
+            self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz123456", json.dumps(evidence))
+
+    def test_malformed_jsonl_is_counted_and_later_events_are_parsed(self):
+        stdout = 'not-json\n{"type":"future.event"}\n{"type":"turn.failed","error":{"code":"network_error","message":"down"}}\n'
+        evidence = self.mod.parse_transport_evidence(stdout, "", 1, False)
+        self.assertEqual(evidence["malformed_jsonl_events"], 1)
+        self.assertEqual(evidence["unknown_event_types"], 1)
+        self.assertTrue(evidence["structured_transport_evidence"])
 
 
 if __name__ == "__main__":

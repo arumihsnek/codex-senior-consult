@@ -233,17 +233,39 @@ def _credential_like(key: str, value: Any) -> bool:
     exact = re.fullmatch(r"(?i)(?:password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|credential|authorization|bearer|auth)", key)
     return bool(exact)
 
-def secret_locations(value: Any, path: str = "$") -> list[str]:
-    hits: list[str] = []
+def _privacy_category(key: str, value: Any) -> str | None:
+    folded = key.casefold()
+    if folded in {"sha256", "fingerprint", "repository_head", "working_tree_fingerprint",
+                  "plan_fingerprint", "checkpoint_fingerprint", "identity_fingerprint"} and \
+            isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40,64}", value): return None
+    patterns = [pattern for pattern in SECRET_PATTERNS if pattern.search(value)] if isinstance(value, str) else []
+    if patterns:
+        if "private key" in value.casefold(): return "private_key_material"
+        return "credential_shaped_value"
+    if not SENSITIVE_KEY.search(key): return None
+    if isinstance(value, bool) and re.search(r"(?i)(?:added|reviewed|present|enabled|disabled|checked)$", key): return None
+    if isinstance(value, str) and DESCRIPTIVE_KEY.search(key) and len(value) < 500: return None
+    if value in (None, "", [], {}): return None
+    return "ambiguous_sensitive_value"
+
+def privacy_findings(value: Any, path: str = "") -> list[dict[str, str]]:
+    findings: list[dict[str, str]] = []
     if isinstance(value, dict):
         for key, child in value.items():
-            child_path = f"{path}.{key}"
-            if _credential_like(str(key), child): hits.append(child_path)
-            hits.extend(secret_locations(child, child_path))
+            escaped = str(key).replace("~", "~0").replace("/", "~1"); child_path = f"{path}/{escaped}"
+            category = _privacy_category(str(key), child)
+            if category: findings.append({"path": child_path, "category": category})
+            findings.extend(privacy_findings(child, child_path))
     elif isinstance(value, list):
-        for i, child in enumerate(value): hits.extend(secret_locations(child, f"{path}[{i}]"))
-    elif isinstance(value, str) and any(pattern.search(value) for pattern in SECRET_PATTERNS): hits.append(path)
-    return sorted(set(hits))
+        for index, child in enumerate(value): findings.extend(privacy_findings(child, f"{path}/{index}"))
+    elif isinstance(value, str) and any(pattern.search(value) for pattern in SECRET_PATTERNS):
+        findings.append({"path": path or "/", "category": "private_key_material" if "private key" in value.casefold() else "credential_shaped_value"})
+    unique = {(item["path"], item["category"]): item for item in findings}
+    return [unique[key] for key in sorted(unique)]
+
+def secret_locations(value: Any, path: str = "$") -> list[str]:
+    prefix = "" if path == "$" else path
+    return sorted({f["path"] if not prefix else f"{prefix}{f['path']}" for f in privacy_findings(value)})
 
 def private_path_locations(value: Any, path: str = "$") -> list[str]:
     hits: list[str] = []
@@ -480,6 +502,43 @@ def sanitize_transport_stderr(stderr: str) -> str:
     value = re.sub(r"(?<![A-Za-z0-9])(?:/home/[^\s]+|/tmp/[^\s]+)", "<path>", value)
     lines = [line.strip() for line in value.splitlines() if line.strip()]
     return " | ".join(lines[-8:])[:1200]
+
+def parse_transport_evidence(stdout: str, stderr: str, exit_code: int, timed_out: bool,
+                             *, event_limit: int = 128, evidence_limit: int = 8) -> dict[str, Any]:
+    malformed = unknown = 0; structured = False; evidence: list[dict[str, str]] = []
+    known = {"thread.started", "turn.started", "turn.completed", "turn.failed", "item.started",
+             "item.updated", "item.completed", "error", *TOOL_ITEM_TYPES}
+    for line in stdout.splitlines()[:event_limit]:
+        if not line.strip(): continue
+        try: event = json.loads(line)
+        except json.JSONDecodeError: malformed += 1; continue
+        typ = event.get("type")
+        if typ not in known: unknown += 1
+        if typ not in {"error", "turn.failed"}: continue
+        structured = True; error = event.get("error") if isinstance(event.get("error"), dict) else {}
+        code = error.get("code") or event.get("code") or "unclassified"
+        evidence.append({"source": f"jsonl.{typ}", "code": re.sub(r"[^a-z0-9_.-]", "_", str(code).casefold())[:80]})
+    sanitized = sanitize_transport_stderr(stderr)
+    codes = " ".join(item["code"] for item in evidence); text = (codes + " " + sanitized).casefold()
+    if timed_out: category = "PROCESS_TIMEOUT"
+    elif any(x in text for x in ("unknown option", "unrecognized option", "unexpected argument", "invalid value for")): category = "CLI_ARGUMENT_FAILURE"
+    elif any(x in text for x in ("unauthorized", "authentication", "not logged in", "login required", "401", "403")): category = "AUTHENTICATION_FAILURE"
+    elif any(x in text for x in ("model_not_found", "model unavailable", "unknown model")): category = "MODEL_UNAVAILABLE"
+    elif any(x in text for x in ("rate_limit", "quota", "too many requests", "429")): category = "QUOTA_OR_RATE_LIMIT"
+    elif any(x in text for x in ("invalid_json_schema", "invalid_request", "schema rejection")): category = "SCHEMA_OR_REQUEST_REJECTION"
+    elif any(x in text for x in ("safety_policy", "policy rejection", "safety rejection")): category = "SAFETY_OR_POLICY_REJECTION"
+    elif any(x in text for x in ("network", "connection", "dns", "service unavailable", "502", "503", "504")): category = "NETWORK_OR_SERVICE_FAILURE"
+    elif structured: category = "UNKNOWN_TRANSPORT_ERROR"
+    else: category = "PROCESS_EXIT_WITHOUT_STRUCTURED_EVIDENCE"
+    if sanitized:
+        evidence.append({"source": "stderr", "category": category.casefold()})
+    evidence = evidence[:evidence_limit]
+    normalized = {"transport_category": category, "transport_evidence": evidence,
+                  "transport_exit_code": exit_code, "structured_transport_evidence": structured,
+                  "malformed_jsonl_events": malformed, "unknown_event_types": unknown,
+                  "diagnostics_truncated": len(stdout.splitlines()) > event_limit or len(evidence) >= evidence_limit}
+    normalized["diagnostic_fingerprint"] = sha256(normalized)
+    return normalized
 
 def run_process(command: list[str], prompt: str, timeout: int, cwd: Path) -> tuple[int, str, str, bool]:
     proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, env=child_environment(), start_new_session=True)
@@ -728,10 +787,11 @@ def main(argv: list[str] | None = None) -> int:
                 command = ["codex", "--ask-for-approval", "never", "exec", "--ephemeral", "-C", work, "--sandbox", "read-only", "--json", "--output-schema", str(schema_file), "-o", str(output_file), "--ignore-user-config", "--ignore-rules", "-c", "shell_environment_policy.inherit=none", "--skip-git-repo-check", "-m", args.model, "-c", f'model_reasoning_effort="{args.effective_effort}"', "-"]
                 for attempt in range(1 + args.transport_retries):
                     total_processes += 1; rc, stdout, stderr, timeout = run_process(command, prompt, args.timeout, Path(work)); t, tool_count, terminal, diagnostics = count_events(stdout); turns += t; tools += tool_count
-                    if timeout: detailed = "TIMEOUT"; break
+                    if timeout:
+                        detailed = "TIMEOUT"; transport = parse_transport_evidence(stdout, stderr, rc, True); break
                     if rc != 0:
                         detailed = "TRANSPORT_ERROR"
-                        transport = {"transport_exit_code": rc, "transport_category": classify_transport_failure(stderr, stdout), "stderr_summary": sanitize_stderr(stderr), "stderr_fingerprint": hashlib.sha256(stderr.encode()).hexdigest(), "transport_event_summary": transport_event_summary(stdout)}
+                        transport = parse_transport_evidence(stdout, stderr, rc, False)
                         retries += int(attempt < args.transport_retries)
                         continue
                     if diagnostics or tools or turns != 1 or not terminal: detailed = "SINGLE_PASS_CONTRACT_VIOLATION"; break
