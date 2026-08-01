@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Run one bounded, single-pass Codex senior consultation."""
-
+"""Run one bounded, single-pass senior consultation."""
 from __future__ import annotations
 
 import argparse
@@ -16,905 +15,586 @@ import stat
 import subprocess
 import sys
 import tempfile
+import uuid
 from typing import Any
 
-
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 BUNDLE_SCHEMA = "codex-senior-consult/v1"
-RESPONSE_SCHEMA = "codex-senior-consult-response/v1"
-MODES = {
-    "integrated-review", "plan", "plan-review", "replan", "blocker-analysis",
-    "risk-audit", "final-review", "merge-gate",
-}
+RESPONSE_SCHEMA = "codex-senior-consult-response/v2"
+LEGACY_RESPONSE_SCHEMA = "codex-senior-consult-response/v1"
+RESPONSE_ARTIFACT_SCHEMA = "codex-senior-consult-response-artifact/v1"
+MODES = {"integrated-review", "plan", "plan-review", "replan", "blocker-analysis", "risk-audit", "final-review", "merge-gate"}
 EFFORTS = {"low", "medium", "high", "xhigh"}
-MEDIUM_TRIGGERS = {
-    "cross_cutting_architecture", "security", "credentials", "process_isolation",
-    "contradictory_evidence", "concurrency", "duplicate_side_effects",
-    "public_contract", "destructive_migration", "alternatives_tie",
-    "conceptual_plan_failure", "recovery",
-}
-ESCALATION_REASONS = MEDIUM_TRIGGERS | {"merge_decision", "irreversible_action"}
-TOOL_ITEM_TYPES = {
-    "command_execution", "mcp_tool_call", "dynamic_tool_call", "collab_tool_call",
-    "web_search", "computer_tool_call", "file_search_call", "function_call", "file_change",
-}
+MEDIUM_TRIGGERS = {"cross_cutting_architecture", "security", "credentials", "process_isolation", "contradictory_evidence", "concurrency", "duplicate_side_effects", "public_contract", "destructive_migration", "alternatives_tie", "conceptual_plan_failure", "recovery"}
+TOOL_ITEM_TYPES = {"command_execution", "mcp_tool_call", "dynamic_tool_call", "collab_tool_call", "web_search", "computer_tool_call", "file_search_call", "function_call", "file_change"}
 NON_TOOL_ITEM_TYPES = {"agent_message", "reasoning", "todo_list", "error"}
 SECRET_PATTERNS = [
-    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{20,}\b"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"), re.compile(r"\b(?:ghp|github_pat)_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"), re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"),
-    re.compile(r"\b(?:xox[baprs]-|ya29\.)[A-Za-z0-9._-]{16,}\b"),
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{16,}={0,2}\b"),
     re.compile(r"(?i)\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis)://[^\s:@/]+:[^\s@/]+@"),
-    re.compile(r"(?i)\b(?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token)\b\s*[:=]\s*['\"]?[^\s'\"]{8,}"),
+    re.compile(r"(?i)\b(?:password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret)\b\s*[:=]\s*['\"]?[^\s'\"]{8,}"),
 ]
-BASE_REQUIRED = {
-    "schema_version", "mission_id", "mode", "objective", "decision_needed",
-    "current_plan", "progress", "relevant_contracts", "observed_facts",
-    "invalidated_assumptions", "candidate_decision", "alternatives", "code_excerpts",
-    "diff", "tests", "runtime_evidence", "constraints", "risks_already_identified",
-    "questions", "requested_output", "snapshot", "escalation",
-}
-
+SENSITIVE_KEY = re.compile(r"(?i)(?:password|passwd|secret|api.?key|access.?token|refresh.?token|private.?key|credential|authorization|bearer|auth)")
+DESCRIPTIVE_KEY = re.compile(r"(?i)(?:scope|contract|policy|description|behavior|redaction|metadata|requirement|finding|risk)")
+BASE_REQUIRED = {"schema_version", "mission_id", "mode", "objective", "decision_needed", "current_plan", "progress", "relevant_contracts", "observed_facts", "invalidated_assumptions", "candidate_decision", "alternatives", "code_excerpts", "diff", "tests", "runtime_evidence", "constraints", "risks_already_identified", "questions", "requested_output", "snapshot", "escalation"}
 
 class ConsultError(Exception):
     def __init__(self, code: str, details: list[str] | None = None):
-        super().__init__(code)
-        self.code = code
-        self.details = details or []
+        super().__init__(code); self.code = code; self.details = details or []
 
-
-def utc_now() -> str:
-    return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def canonical(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-
-
-def sha256(value: Any) -> str:
-    return hashlib.sha256(canonical(value)).hexdigest()
-
-
+def utc_now() -> str: return dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+def canonical(value: Any) -> bytes: return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+def sha256(value: Any) -> str: return hashlib.sha256(canonical(value)).hexdigest()
 def safe_mission_id(value: str) -> str:
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value or ""):
-        raise ConsultError("INVALID_MISSION_ID", ["mission_id must be path-safe and 1-128 characters"])
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value or ""): raise ConsultError("INVALID_MISSION_ID", ["mission_id must be path-safe and 1-128 characters"])
     return value
 
-
 def secure_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise ConsultError("INVALID_STATE_PATH", ["state directory must not be a symlink or special file"])
+    path.mkdir(parents=True, exist_ok=True, mode=0o700); info = path.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode): raise ConsultError("INVALID_STATE_PATH", ["state directory must be a real directory"])
     path.chmod(0o700)
 
+def _fsync_directory(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try: os.fsync(fd)
+    finally: os.close(fd)
 
 def secure_write(path: Path, data: str) -> None:
     secure_dir(path.parent)
-    if os.path.lexists(path) and stat.S_ISLNK(path.lstat().st_mode):
-        raise ConsultError("INVALID_STATE_PATH", ["refusing to replace a symlinked state file"])
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    temp_path = Path(temp_name)
+    if os.path.lexists(path) and stat.S_ISLNK(path.lstat().st_mode): raise ConsultError("INVALID_STATE_PATH", ["refusing symlink state file"])
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
-        os.fchmod(fd, 0o600)
         payload = memoryview(data.encode())
+        os.fchmod(fd, 0o600)
         while payload:
-            payload = payload[os.write(fd, payload):]
-        os.fsync(fd)
-        os.close(fd)
-        fd = -1
-        os.replace(temp_path, path)
-    except BaseException:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            temp_path.unlink()
-        except OSError:
-            pass
-        raise
-    path.chmod(0o600)
-
+            written = os.write(fd, payload)
+            if written <= 0: raise OSError("short state-file write")
+            payload = payload[written:]
+        os.fsync(fd); os.close(fd); fd = -1
+        os.replace(name, path); path.chmod(0o600); _fsync_directory(path.parent)
+    finally:
+        if fd >= 0: os.close(fd)
+        try: Path(name).unlink()
+        except OSError: pass
 
 def read_regular_input(raw_path: str, max_bytes: int) -> tuple[Path, bytes]:
     raw = Path(raw_path)
-    if ".." in raw.parts:
-        raise ConsultError("INVALID_BUNDLE_PATH", ["path traversal is not allowed"])
-    try:
-        initial = raw.lstat()
-    except OSError:
-        raise ConsultError("INVALID_BUNDLE_PATH", ["bundle is not an accessible regular file"])
-    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISREG(initial.st_mode):
-        raise ConsultError("INVALID_BUNDLE_PATH", ["symlinks, FIFOs, sockets, and devices are rejected"])
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = -1
-    try:
-        fd = os.open(raw, flags)
-        info = os.fstat(fd)
-    except OSError:
-        if fd >= 0:
-            os.close(fd)
-        raise ConsultError("INVALID_BUNDLE_PATH", ["bundle is not an accessible regular file"])
-    if not stat.S_ISREG(info.st_mode):
-        os.close(fd)
-        raise ConsultError("INVALID_BUNDLE_PATH", ["symlinks, FIFOs, sockets, and devices are rejected"])
-    if info.st_size > max_bytes:
-        os.close(fd)
-        raise ConsultError("BUNDLE_TOO_LARGE", [f"bundle exceeds {max_bytes} bytes"])
-    try:
-        chunks: list[bytes] = []
-        remaining = max_bytes + 1
-        while remaining:
-            chunk = os.read(fd, remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        data = b"".join(chunks)
-    finally:
-        os.close(fd)
-    if len(data) > max_bytes:
-        raise ConsultError("BUNDLE_TOO_LARGE", [f"bundle exceeds {max_bytes} bytes"])
+    if ".." in raw.parts: raise ConsultError("INVALID_BUNDLE_PATH", ["path traversal is not allowed"])
+    try: initial = raw.lstat()
+    except OSError: raise ConsultError("INVALID_BUNDLE_PATH", ["bundle is not an accessible regular file"])
+    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISREG(initial.st_mode): raise ConsultError("INVALID_BUNDLE_PATH", ["symlinks and special files are rejected"])
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try: fd = os.open(raw, flags); info = os.fstat(fd)
+    except OSError: raise ConsultError("INVALID_BUNDLE_PATH", ["bundle is not an accessible regular file"])
+    if not stat.S_ISREG(info.st_mode): os.close(fd); raise ConsultError("INVALID_BUNDLE_PATH", ["bundle is not regular"])
+    if info.st_size > max_bytes: os.close(fd); raise ConsultError("BUNDLE_TOO_LARGE", [f"bundle exceeds {max_bytes} bytes"])
+    try: data = os.read(fd, max_bytes + 1)
+    finally: os.close(fd)
+    if len(data) > max_bytes: raise ConsultError("BUNDLE_TOO_LARGE", [f"bundle exceeds {max_bytes} bytes"])
     return raw.resolve(), data
 
+def _credential_like(key: str, value: Any) -> bool:
+    if value in (None, "", [], {}): return False
+    if not SENSITIVE_KEY.search(key): return False
+    if DESCRIPTIVE_KEY.search(key) and isinstance(value, str) and len(value) < 500: return False
+    if isinstance(value, (dict, list)): return True
+    if not isinstance(value, str): return True
+    if any(pattern.search(value) for pattern in SECRET_PATTERNS): return True
+    # A non-empty value under an exact credential key is ambiguous and fails closed;
+    # ordinary prose is allowed only in explicitly descriptive fields.
+    exact = re.fullmatch(r"(?i)(?:password|passwd|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|private[_-]?key|credential|authorization|bearer|auth)", key)
+    return bool(exact)
 
 def secret_locations(value: Any, path: str = "$") -> list[str]:
     hits: list[str] = []
     if isinstance(value, dict):
         for key, child in value.items():
-            key_path = f"{path}.{key}"
-            if re.search(r"(?i)(password|passwd|secret|api.?key|access.?token|refresh.?token|private.?key|auth)", str(key)):
-                if child not in (None, "", [], {}):
-                    hits.append(key_path)
-            hits.extend(secret_locations(child, key_path))
+            child_path = f"{path}.{key}"
+            if _credential_like(str(key), child): hits.append(child_path)
+            hits.extend(secret_locations(child, child_path))
     elif isinstance(value, list):
-        for idx, child in enumerate(value):
-            hits.extend(secret_locations(child, f"{path}[{idx}]"))
-    elif isinstance(value, str) and any(pattern.search(value) for pattern in SECRET_PATTERNS):
-        hits.append(path)
+        for i, child in enumerate(value): hits.extend(secret_locations(child, f"{path}[{i}]"))
+    elif isinstance(value, str) and any(pattern.search(value) for pattern in SECRET_PATTERNS): hits.append(path)
     return sorted(set(hits))
-
 
 def private_path_locations(value: Any, path: str = "$") -> list[str]:
     hits: list[str] = []
     if isinstance(value, dict):
         for key, child in value.items():
-            key_path = f"{path}.{key}"
-            if str(key).casefold() in {"path", "file", "filename"} and isinstance(child, str):
-                candidate = Path(child)
-                if candidate.is_absolute() or ".." in candidate.parts or child.startswith("~"):
-                    hits.append(key_path)
-            hits.extend(private_path_locations(child, key_path))
+            child_path = f"{path}.{key}"
+            if str(key).casefold() in {"path", "file", "filename"} and isinstance(child, str) and (Path(child).is_absolute() or ".." in Path(child).parts or child.startswith("~")): hits.append(child_path)
+            hits.extend(private_path_locations(child, child_path))
     elif isinstance(value, list):
-        for idx, child in enumerate(value):
-            hits.extend(private_path_locations(child, f"{path}[{idx}]"))
+        for i, child in enumerate(value): hits.extend(private_path_locations(child, f"{path}[{i}]"))
     return sorted(set(hits))
 
-
 def validate_and_prepare_bundle(bundle: Any, mission_id: str, mode: str) -> dict[str, Any]:
-    missing: list[str] = []
-    if not isinstance(bundle, dict):
-        raise ConsultError("BUNDLE_INCOMPLETE", ["bundle must be a JSON object"])
-    for key in sorted(BASE_REQUIRED - set(bundle)):
-        missing.append(f"missing field: {key}")
-    if bundle.get("schema_version") != BUNDLE_SCHEMA:
-        missing.append(f"schema_version must be {BUNDLE_SCHEMA}")
-    if bundle.get("mission_id") != mission_id:
-        missing.append("bundle mission_id must match --mission-id")
-    if bundle.get("mode") != mode or mode not in MODES:
-        missing.append("bundle mode must match a supported --mode")
+    if not isinstance(bundle, dict): raise ConsultError("BUNDLE_INCOMPLETE", ["bundle must be an object"])
+    missing = [f"missing field: {k}" for k in sorted(BASE_REQUIRED - set(bundle))]
+    if bundle.get("schema_version") != BUNDLE_SCHEMA: missing.append(f"schema_version must be {BUNDLE_SCHEMA}")
+    if bundle.get("mission_id") != mission_id: missing.append("bundle mission_id must match --mission-id")
+    if bundle.get("mode") != mode or mode not in MODES: missing.append("bundle mode must match supported --mode")
     for key in ("objective", "decision_needed"):
-        if not isinstance(bundle.get(key), str) or not bundle.get(key, "").strip():
-            missing.append(f"{key} must be a non-empty string")
+        if not isinstance(bundle.get(key), str) or not bundle[key].strip(): missing.append(f"{key} must be non-empty")
     for key in ("current_plan", "progress", "candidate_decision"):
-        if not isinstance(bundle.get(key), dict) or not bundle.get(key):
-            missing.append(f"{key} must be a non-empty object")
-    if not isinstance(bundle.get("alternatives"), list) or not bundle.get("alternatives"):
-        missing.append("alternatives must be a non-empty list")
-    if (not isinstance(bundle.get("constraints"), list) or not bundle.get("constraints") or
-            not all(isinstance(item, str) and item.strip() for item in bundle.get("constraints", []))):
-        missing.append("constraints must be a non-empty string list")
+        if not isinstance(bundle.get(key), dict) or not bundle[key]: missing.append(f"{key} must be a non-empty object")
+    if not isinstance(bundle.get("alternatives"), list) or not bundle["alternatives"]: missing.append("alternatives must be a non-empty list")
+    if not isinstance(bundle.get("constraints"), list) or not bundle["constraints"] or not all(isinstance(x, str) and x.strip() for x in bundle["constraints"]): missing.append("constraints must be a non-empty string list")
     questions = bundle.get("questions")
-    if not isinstance(questions, list) or not any(isinstance(q, str) and q.strip() for q in questions or []):
-        missing.append("questions must contain concrete questions")
+    if not isinstance(questions, list) or not any(isinstance(q, (str, dict)) and q for q in questions): missing.append("questions must contain concrete questions")
     requested = bundle.get("requested_output")
-    if not isinstance(requested, dict) or requested.get("schema_version") != RESPONSE_SCHEMA:
-        missing.append(f"requested_output.schema_version must be {RESPONSE_SCHEMA}")
-    snapshot = bundle.get("snapshot")
-    snapshot_keys = {"repository_head", "working_tree_fingerprint", "plan_fingerprint", "checkpoint_fingerprint"}
-    if not isinstance(snapshot, dict) or not snapshot_keys.issubset(snapshot):
-        missing.append("snapshot must identify HEAD, working tree, plan, and checkpoint")
-    elif (not re.fullmatch(r"[0-9a-f]{40,64}", snapshot["repository_head"]) or
-          any(not re.fullmatch(r"[0-9a-f]{64}", snapshot[k])
-              for k in snapshot_keys - {"repository_head"})):
-        missing.append("snapshot must use a 40-64 hex HEAD and 64-hex fingerprints")
-    evidence_fields = ("relevant_contracts", "observed_facts", "code_excerpts", "tests", "runtime_evidence")
-    if not any(bundle.get(key) for key in evidence_fields):
-        missing.append("at least one relevant evidence field must be non-empty")
-    for key in ("relevant_contracts", "observed_facts", "invalidated_assumptions",
-                "code_excerpts", "tests", "runtime_evidence", "risks_already_identified"):
-        if not isinstance(bundle.get(key), list):
-            missing.append(f"{key} must be an array")
-    escalation = bundle.get("escalation")
-    if not isinstance(escalation, dict):
-        missing.append("escalation must be an object")
+    if not isinstance(requested, dict) or requested.get("schema_version") not in {RESPONSE_SCHEMA, LEGACY_RESPONSE_SCHEMA}: missing.append("requested_output.schema_version must be v2 or explicit legacy v1")
+    snapshot = bundle.get("snapshot"); snapshot_keys = {"repository_head", "working_tree_fingerprint", "plan_fingerprint", "checkpoint_fingerprint"}
+    if not isinstance(snapshot, dict) or not snapshot_keys.issubset(snapshot): missing.append("snapshot must identify HEAD and all fingerprints")
+    elif (not re.fullmatch(r"[0-9a-f]{40,64}", str(snapshot["repository_head"])) or any(not re.fullmatch(r"[0-9a-f]{64}", str(snapshot[k])) for k in snapshot_keys - {"repository_head"})): missing.append("snapshot fingerprints are invalid")
+    if not any(bundle.get(k) for k in ("relevant_contracts", "observed_facts", "code_excerpts", "tests", "runtime_evidence")): missing.append("at least one evidence field must be non-empty")
+    for key in ("relevant_contracts", "observed_facts", "invalidated_assumptions", "code_excerpts", "tests", "runtime_evidence", "risks_already_identified"):
+        if not isinstance(bundle.get(key), list): missing.append(f"{key} must be an array")
+    esc = bundle.get("escalation")
+    if not isinstance(esc, dict): missing.append("escalation must be an object")
     else:
-        checks = escalation.get("local_deterministic_checks")
-        if not isinstance(checks, list) or not checks or not all(isinstance(x, str) and x.strip() for x in checks):
-            missing.append("escalation.local_deterministic_checks must list completed local work")
-        if not isinstance(escalation.get("material_impact"), str) or not escalation.get("material_impact", "").strip():
-            missing.append("escalation.material_impact must explain what the answer can change")
-    if missing:
-        raise ConsultError("BUNDLE_INCOMPLETE", missing)
+        if not isinstance(esc.get("local_deterministic_checks"), list) or not esc["local_deterministic_checks"]: missing.append("escalation.local_deterministic_checks must be non-empty")
+        if not isinstance(esc.get("material_impact"), str) or not esc["material_impact"].strip(): missing.append("escalation.material_impact must be non-empty")
+    if missing: raise ConsultError("BUNDLE_INCOMPLETE", missing)
     hits = secret_locations(bundle)
-    if hits:
-        raise ConsultError("SECRET_DETECTED", [f"secret-like value at {path}" for path in hits])
-    private_paths = private_path_locations(bundle)
-    if private_paths:
-        raise ConsultError("PRIVATE_PATH_DETECTED", [f"absolute or traversing path at {path}" for path in private_paths])
-    normalized = json.loads(json.dumps(bundle))
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for raw_question in normalized["questions"]:
-        if not isinstance(raw_question, str) or not raw_question.strip():
-            continue
-        question = " ".join(raw_question.split())
-        key = question.casefold()
-        if key not in seen:
-            seen.add(key)
-            deduped.append(question)
-    normalized["questions"] = deduped
-    long_values: list[str] = []
-    def collect(v: Any) -> None:
-        if isinstance(v, dict):
-            for child in v.values(): collect(child)
-        elif isinstance(v, list):
-            for child in v: collect(child)
-        elif isinstance(v, str) and len(v) >= 512:
-            long_values.append(v)
-    collect(normalized)
-    duplicates = len(long_values) - len(set(long_values))
-    if duplicates > 2:
-        raise ConsultError("BUNDLE_INCOMPLETE", ["bundle contains large duplicated evidence"])
+    if hits: raise ConsultError("SECRET_DETECTED", [f"secret-like material at {x}" for x in hits])
+    private = private_path_locations(bundle)
+    if private: raise ConsultError("PRIVATE_PATH_DETECTED", [f"private path at {x}" for x in private])
+    normalized = json.loads(json.dumps(bundle)); seen: set[str] = set()
+    for i, q in enumerate(normalized["questions"]):
+        if isinstance(q, str): q = {"id": f"Q{i + 1}", "text": q}; normalized["questions"][i] = q
+        if not isinstance(q, dict) or not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", str(q.get("id", ""))) or not isinstance(q.get("text"), str) or not q["text"].strip() or q["id"] in seen: raise ConsultError("BUNDLE_INCOMPLETE", [f"questions[{i}] requires unique id and text"])
+        seen.add(q["id"])
+    normalized["normalized_bundle_fingerprint"] = sha256(normalized)
     return normalized
 
+def question_ids(bundle: dict[str, Any]) -> list[str]: return [str(q["id"]) for q in bundle["questions"]]
 
-def escalation_reasons(bundle: dict[str, Any]) -> list[str]:
-    gate = bundle.get("escalation", {})
-    reasons = gate.get("reasons", []) if isinstance(gate, dict) else []
-    return [r for r in reasons if isinstance(r, str) and r in ESCALATION_REASONS]
+STRING = {"type": "string", "minLength": 1}
+# Codex's structured-output endpoint rejects JSON Schema `uniqueItems`; keep
+# list elements non-empty and enforce cross-item rules locally where required.
+STRING_LIST = {"type": "array", "items": STRING}
+QUESTION_ANSWER = {"type": "object", "additionalProperties": False, "required": ["id", "answer"], "properties": {"id": STRING, "answer": STRING}}
+FINDING = {"type": "object", "additionalProperties": False, "required": ["id", "claim", "severity", "evidence", "reasoning_summary"], "properties": {"id": STRING, "claim": STRING, "severity": {"type": "string", "enum": ["blocking", "non_blocking"]}, "evidence": STRING_LIST, "reasoning_summary": STRING}}
+CAUSE = {"type": "object", "additionalProperties": False, "required": ["id", "cause", "evidence"], "properties": {"id": STRING, "cause": STRING, "evidence": STRING_LIST}}
+PATH = {"type": "object", "additionalProperties": False, "required": ["id", "action", "rationale"], "properties": {"id": STRING, "action": STRING, "rationale": STRING}}
+RISK = {"type": "object", "additionalProperties": False, "required": ["id", "risk", "impact"], "properties": {"id": STRING, "risk": STRING, "impact": STRING}}
+CLAIM = {"type": "object", "additionalProperties": False, "required": ["claim", "classification", "evidence"], "properties": {"claim": STRING, "classification": {"type": "string", "enum": ["supported", "unsupported", "uncertain"]}, "evidence": STRING_LIST}}
+DECISION = {"type": "object", "additionalProperties": False, "required": ["recommendation", "rationale"], "properties": {"recommendation": STRING, "rationale": STRING}}
+PLAN = {"type": "object", "additionalProperties": False, "required": ["steps", "stop_conditions"], "properties": {"steps": STRING_LIST, "stop_conditions": STRING_LIST}}
 
+# This is the authoritative v2 contract.  Both emitted JSON Schema and the
+# local semantic validator below derive their structural rules from it.
+MODE_CONTRACTS: dict[str, dict[str, Any]] = {
+    "merge-gate": {"verdicts": ("accept", "changes_required", "blocked"), "fields": {"safe_to_merge": {"type": "boolean"}, "blocking_findings": {"type": "array", "items": FINDING}, "required_actions": STRING_LIST, "residual_risks": {"type": "array", "items": RISK}, "summary": STRING}},
+    "blocker-analysis": {"verdicts": ("continue", "human_required", "blocked"), "fields": {"ranked_causes": {"type": "array", "items": CAUSE}, "continuation_paths": {"type": "array", "items": PATH}, "recommended_path": STRING, "cheapest_discriminating_experiment": STRING, "stop_conditions": STRING_LIST, "next_safe_step": STRING}},
+    "replan": {"verdicts": ("continue", "changes_required", "blocked"), "fields": {"invalidated_assumptions": STRING_LIST, "plan_delta": STRING_LIST, "closed_phases_preserved": STRING_LIST, "new_stop_conditions": STRING_LIST, "next_safe_step": STRING}},
+    "integrated-review": {"verdicts": ("accept", "changes_required", "blocked"), "fields": {"summary": STRING, "findings": {"type": "array", "items": FINDING}, "decision": DECISION, "next_safe_step": STRING}},
+    "plan": {"verdicts": ("continue", "changes_required", "blocked"), "fields": {"summary": STRING, "plan": PLAN, "risks": {"type": "array", "items": RISK}, "next_safe_step": STRING}},
+    "plan-review": {"verdicts": ("accept", "changes_required", "blocked"), "fields": {"summary": STRING, "blocking_findings": {"type": "array", "items": FINDING}, "required_actions": STRING_LIST, "next_safe_step": STRING}},
+    "risk-audit": {"verdicts": ("continue", "changes_required", "blocked"), "fields": {"risks": {"type": "array", "items": RISK}, "controls": STRING_LIST, "residual_risks": {"type": "array", "items": RISK}, "next_safe_step": STRING}},
+    "final-review": {"verdicts": ("accept", "changes_required", "blocked"), "fields": {"claim_classifications": {"type": "array", "items": CLAIM}, "summary": STRING, "next_safe_step": STRING}},
+}
+MODE_FIELDS = {mode: ("verdict", *contract["fields"].keys(), "question_answers") for mode, contract in MODE_CONTRACTS.items()}
+TRANSPORT_SCHEMA_ALLOWLIST = {"type", "properties", "required", "additionalProperties", "items", "enum", "description"}
 
-def response_schema(mission_id: str, mode: str, model: str, effort: str, question_count: int,
-                    snapshot: str) -> dict[str, Any]:
-    finding = {
-        "type": "object", "additionalProperties": False,
-        "required": ["id", "claim", "severity", "evidence", "reasoning_summary", "required_change"],
-        "properties": {
-            "id": {"type": "string"}, "claim": {"type": "string"},
-            "severity": {"enum": ["blocking", "non_blocking"]},
-            "evidence": {"type": "array", "items": {"type": "string"}},
-            "reasoning_summary": {"type": "string"},
-            "required_change": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        },
-    }
-    properties: dict[str, Any] = {
-        "schema_version": {"type": "string", "const": RESPONSE_SCHEMA},
-        "mission_id": {"type": "string", "const": mission_id},
-        "mode": {"type": "string", "const": mode},
-        "model": {"type": "string", "const": model},
-        "reasoning_effort": {"type": "string", "const": effort},
-        "snapshot": {"type": "string", "const": snapshot},
-        "verdict": {"enum": ["accept", "changes_required", "blocked"] if mode == "merge-gate"
-                    else ["accept", "changes_required", "blocked", "proposed"]},
-        "summary": {"type": "string"},
-        "blocking_findings": {"type": "array", "items": finding},
-        "non_blocking_findings": {"type": "array", "items": finding},
-        "assumptions": {"type": "array", "items": {"type": "string"}},
-        "required_actions": {"type": "array", "items": {"type": "string"}},
-        "plan_delta": {"type": "array", "items": {"type": "string"}},
-        "evidence_missing": {"type": "array", "items": {"type": "string"}},
-        "questions_answered": {
-            "type": "array", "minItems": question_count, "maxItems": question_count,
-            "items": {
-                "type": "object", "additionalProperties": False,
-                "required": ["question", "answer"],
-                "properties": {"question": {"type": "string"}, "answer": {"type": "string"}},
-            },
-        },
-        "next_safe_step": {"type": "string"}, "confidence": {"enum": ["low", "medium", "high"]},
-        "safe_to_merge": {"type": "boolean"},
-    }
-    if mode != "merge-gate":
-        properties.pop("safe_to_merge")
-    required = list(properties)
-    return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
-            "additionalProperties": False, "required": required, "properties": properties}
+def local_semantic_contract(mode: str = "integrated-review", schema_version: str = RESPONSE_SCHEMA) -> dict[str, Any]:
+    contract = MODE_CONTRACTS[mode]
+    properties = {"schema_version": {"type": "string", "const": schema_version}, "verdict": {"type": "string", "enum": list(contract["verdicts"])}, "question_answers": {"type": "array", "items": QUESTION_ANSWER}, **contract["fields"]}
+    return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "additionalProperties": False, "required": list(properties), "properties": properties}
 
+def _conservative_transport_shape(value: Any) -> Any:
+    if isinstance(value, list): return [_conservative_transport_shape(item) for item in value]
+    if not isinstance(value, dict): return value
+    out: dict[str, Any] = {}
+    for key, child in value.items():
+        if key not in TRANSPORT_SCHEMA_ALLOWLIST: continue
+        if key == "properties" and isinstance(child, dict):
+            out[key] = {name: _conservative_transport_shape(schema) for name, schema in child.items()}
+        else:
+            out[key] = _conservative_transport_shape(child)
+    if out.get("additionalProperties") is False and isinstance(out.get("properties"), dict):
+        # The backend's strict-output dialect requires every declared property
+        # to be listed in required; local semantics retain true optionality.
+        out["required"] = list(out["properties"])
+    return out
 
-def validate_response(value: Any, mission_id: str, mode: str, model: str, effort: str,
-                      questions: list[str], snapshot: str) -> list[str]:
-    errors: list[str] = []
-    if not isinstance(value, dict):
-        return ["response must be a JSON object"]
-    expected = {
-        "schema_version": RESPONSE_SCHEMA, "mission_id": mission_id, "mode": mode,
-        "model": model, "reasoning_effort": effort, "snapshot": snapshot,
-    }
-    for key, wanted in expected.items():
-        if value.get(key) != wanted:
-            errors.append(f"{key} must equal {wanted}")
-    schema = response_schema(mission_id, mode, model, effort, len(questions), snapshot)
-    required = set(schema["required"])
-    for key in sorted(required - set(value)):
-        errors.append(f"missing response field: {key}")
-    extras = set(value) - set(schema["properties"])
-    for key in sorted(extras):
-        errors.append(f"unexpected response field: {key}")
-    allowed_verdicts = {"accept", "changes_required", "blocked"}
-    if mode != "merge-gate":
-        allowed_verdicts.add("proposed")
-    if value.get("verdict") not in allowed_verdicts:
-        errors.append("invalid verdict")
-    if value.get("confidence") not in {"low", "medium", "high"}:
-        errors.append("invalid confidence")
-    for field in ("blocking_findings", "non_blocking_findings"):
-        findings = value.get(field)
-        if not isinstance(findings, list):
-            errors.append(f"{field} must be an array")
-            continue
-        for idx, finding in enumerate(findings):
-            needed = {"id", "claim", "severity", "evidence", "reasoning_summary", "required_change"}
-            if not isinstance(finding, dict) or set(finding) != needed:
-                errors.append(f"{field}[{idx}] is not a complete finding")
-                continue
-            expected_severity = "blocking" if field == "blocking_findings" else "non_blocking"
-            if (not isinstance(finding["id"], str) or not finding["id"].strip() or
-                    not isinstance(finding["claim"], str) or not finding["claim"].strip() or
-                    finding["severity"] != expected_severity or
-                    not isinstance(finding["evidence"], list) or
-                    not all(isinstance(item, str) for item in finding["evidence"]) or
-                    not isinstance(finding["reasoning_summary"], str) or
-                    not finding["reasoning_summary"].strip() or
-                    finding["required_change"] is not None and
-                    not isinstance(finding["required_change"], str)):
-                errors.append(f"{field}[{idx}] has invalid field types or severity")
-    for field in ("assumptions", "required_actions", "plan_delta", "evidence_missing"):
-        if not isinstance(value.get(field), list) or not all(isinstance(item, str) for item in value.get(field, [])):
-            errors.append(f"{field} must be an array of strings")
-    answered = value.get("questions_answered")
-    if not isinstance(answered, list) or len(answered) != len(questions):
-        errors.append("questions_answered must answer every grouped question exactly once")
-    elif any(not isinstance(item, dict) or set(item) != {"question", "answer"} or
-             not isinstance(item.get("answer"), str) or not item["answer"].strip()
-             for item in answered):
-        errors.append("each questions_answered item must contain a non-empty question and answer")
-    elif [item["question"] for item in answered] != questions:
-        errors.append("questions_answered must preserve the normalized question order")
-    if not isinstance(value.get("summary"), str) or not value.get("summary", "").strip():
-        errors.append("summary must be non-empty")
-    if not isinstance(value.get("next_safe_step"), str) or not value.get("next_safe_step", "").strip():
-        errors.append("next_safe_step must be non-empty")
+def backend_transport_schema(mode: str = "integrated-review") -> dict[str, Any]:
+    return _conservative_transport_shape(local_semantic_contract(mode))
+
+def response_schema(mission_id: str | None = None, mode: str = "integrated-review", model: str | None = None, effort: str | None = None, execution: int | None = None, snapshot: str | None = None, schema_version: str = RESPONSE_SCHEMA) -> dict[str, Any]:
+    return backend_transport_schema(mode)
+
+def _legacy_errors(value: Any, mission_id: str, mode: str, model: str, effort: str, questions: list[Any], snapshot: str) -> list[str]:
+    if not isinstance(value, dict): return ["response must be an object"]
+    required = {"schema_version", "mission_id", "mode", "model", "reasoning_effort", "snapshot", "verdict", "summary", "blocking_findings", "required_actions", "confidence"}
+    errors = [f"missing {x}" for x in sorted(required - set(value))]
+    if value.get("schema_version") != LEGACY_RESPONSE_SCHEMA: errors.append("schema_version must equal legacy v1")
+    for key, expected in (("mission_id", mission_id), ("mode", mode), ("model", model), ("reasoning_effort", effort), ("snapshot", snapshot)):
+        if value.get(key) != expected: errors.append(f"{key} mismatch")
+    if value.get("verdict") not in {"accept", "changes_required", "blocked"}: errors.append("invalid verdict")
     if mode == "merge-gate":
-        accept = value.get("verdict") == "accept"
-        if accept != (value.get("safe_to_merge") is True):
-            errors.append("merge-gate safe_to_merge must be true exactly when verdict is accept")
-        if accept and (value.get("blocking_findings") or value.get("required_actions")):
-            errors.append("merge-gate accept cannot contain blocking findings or required actions")
+        if value.get("verdict") == "accept" and (value.get("safe_to_merge") is not True or value.get("blocking_findings") != [] or value.get("required_actions") != []): errors.append("merge-gate accept is inconsistent")
+        if value.get("verdict") != "accept" and value.get("safe_to_merge") is not False: errors.append("merge-gate non-accept must be unsafe")
+    if not isinstance(value.get("blocking_findings"), list) or not isinstance(value.get("required_actions"), list): errors.append("finding arrays invalid")
+    for finding in value.get("blocking_findings", []):
+        if (not isinstance(finding, dict) or not isinstance(finding.get("id"), str) or not isinstance(finding.get("claim"), str) or not isinstance(finding.get("severity"), str) or not isinstance(finding.get("evidence"), list) or not isinstance(finding.get("reasoning_summary"), str) or ("required_change" in finding and finding.get("required_change") is not None and not isinstance(finding.get("required_change"), str))): errors.append("finding object invalid")
+    if len(value.get("questions_answered", [])) != len(questions): errors.append("every grouped question must be addressed")
+    if set(value) - {"schema_version", "mission_id", "mode", "model", "reasoning_effort", "snapshot", "verdict", "summary", "blocking_findings", "non_blocking_findings", "assumptions", "required_actions", "plan_delta", "evidence_missing", "questions_answered", "next_safe_step", "confidence", "safe_to_merge"}: errors.append("additional property")
     return errors
 
+def validate_response(value: Any, mission_id: str, mode: str, model: str, effort: str, questions: list[Any], snapshot: str, *, allow_legacy: bool = True) -> list[str]:
+    if isinstance(value, dict) and value.get("schema_version") == LEGACY_RESPONSE_SCHEMA:
+        return _legacy_errors(value, mission_id, mode, model, effort, questions, snapshot) if allow_legacy else ["legacy v1 response requires --legacy-response-v1"]
+    if not isinstance(value, dict): return ["response must be an object"]
+    schema = local_semantic_contract(mode=mode); errors = schema_errors(value, schema)
+    if value.get("schema_version") != RESPONSE_SCHEMA: errors.append("schema_version must equal v2")
+    expected_ids = [str(q.get("id")) if isinstance(q, dict) else f"Q{i + 1}" for i, q in enumerate(questions)]
+    answers = value.get("question_answers", [])
+    if isinstance(answers, list):
+        ids = [answer.get("id") for answer in answers if isinstance(answer, dict)]
+        if len(ids) != len(expected_ids) or set(ids) != set(expected_ids) or len(set(ids)) != len(ids): errors.append("question_answers must contain every supplied question ID exactly once")
+    if mode == "merge-gate":
+        if value.get("verdict") == "accept" and (value.get("safe_to_merge") is not True or value.get("blocking_findings") != [] or value.get("required_actions") != []): errors.append("merge-gate accept is inconsistent")
+        if value.get("verdict") != "accept" and value.get("safe_to_merge") is not False: errors.append("merge-gate non-accept must be unsafe")
+        if value.get("verdict") == "changes_required" and not value.get("blocking_findings") and not value.get("required_actions"): errors.append("merge-gate changes_required requires a finding or action")
+        if value.get("verdict") == "blocked" and not value.get("blocking_findings"): errors.append("merge-gate blocked requires blocking evidence")
+    if mode == "plan-review" and value.get("verdict") == "accept" and (value.get("blocking_findings") != [] or value.get("required_actions") != []): errors.append("plan-review accept is inconsistent")
+    if mode == "integrated-review" and value.get("verdict") == "accept" and value.get("findings") != []: errors.append("integrated-review accept is inconsistent")
+    return errors
 
-def normalize_json(text: str) -> Any:
-    candidate = text.strip()
-    if candidate.startswith("```") and candidate.endswith("```"):
-        lines = candidate.splitlines()
-        if len(lines) >= 3:
-            candidate = "\n".join(lines[1:-1]).strip()
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        start = candidate.find("{")
-        if start < 0:
-            raise
-        value, end = json.JSONDecoder().raw_decode(candidate[start:])
-        trailing = candidate[start + end:].strip()
-        if trailing and not trailing.startswith("```"):
-            raise json.JSONDecodeError("non-syntactic trailing content", candidate, start + end)
-        return value
-
-
-def build_prompt(bundle: dict[str, Any], model: str, effort: str) -> str:
-    mode_note = {
-        "integrated-review": "Integrate plan review, unsupported assumptions, risks, all questions, alternatives, candidate decision, minimum plan delta, and next safe step.",
-        "plan": "Propose a complete plan only because local investigation could not produce a viable one.",
-        "plan-review": "Return a verdict, blockers, assumptions, missing gates, minimum changes, and next safe step without needless rewrite.",
-        "replan": "Return a delta from the current plan; return a full replacement only if a delta is impossible and explain why.",
-        "blocker-analysis": "Rank causes and return the cheapest discriminating experiment, stop conditions, and next action.",
-        "risk-audit": "Audit security, privacy, isolation, concurrency, duplicate side effects, rollback, compatibility, data, and observability together.",
-        "final-review": "Classify claims as demonstrated, inferred, deferred, or not demonstrated.",
-        "merge-gate": "Apply a strict merge gate and set safe_to_merge explicitly.",
-    }[bundle["mode"]]
-    contract = """You are a bounded, single-pass senior consultant.
-
-Use only the supplied consultation bundle.
-
-Do not use tools.
-Do not inspect the workspace.
-Do not read files.
-Do not execute commands.
-Do not invoke MCP.
-Do not invoke subagents or other models.
-Do not call codex-senior-consult.
-Do not ask follow-up questions.
-Do not request another turn.
-Do not produce interim progress messages.
-Do not propose continuing later.
-
-Perform all requested analysis from the supplied evidence and return exactly one final response matching the requested contract.
-
-The response must include the exact snapshot string from bundle.snapshot.repository_head in its snapshot field.
-The snapshot field is an immutable identity check; do not omit it or substitute another value.
-For merge-gate, verdict must be exactly accept, changes_required, or blocked; proposed is invalid.
-For merge-gate accept means safe_to_merge=true, blocking_findings=[], and required_actions=[] exactly.
-For merge-gate changes_required or blocked means safe_to_merge=false.
-
-The session terminates after your first response, whether valid or invalid. Return reasoning summaries, never private chain of thought.
-"""
-    return (contract + "\nMode requirement: " + mode_note +
-            f"\nActual model: {model}\nActual reasoning effort: {effort}\nConsultation bundle:\n" +
-            json.dumps(bundle, sort_keys=True, ensure_ascii=False))
-
-
-def cache_key(bundle: dict[str, Any], model: str, effort: str) -> str:
-    snapshot = bundle["snapshot"]
-    material = {
-        "schema_version": BUNDLE_SCHEMA, "mission_id": bundle["mission_id"], "mode": bundle["mode"],
-        "repository_head": snapshot["repository_head"],
-        "working_tree_fingerprint": snapshot["working_tree_fingerprint"],
-        "plan_fingerprint": snapshot["plan_fingerprint"],
-        "checkpoint_fingerprint": snapshot["checkpoint_fingerprint"],
-        "evidence_fingerprint": sha256({k: bundle[k] for k in (
-            "relevant_contracts", "observed_facts", "invalidated_assumptions", "code_excerpts",
-            "diff", "tests", "runtime_evidence", "constraints", "risks_already_identified")}),
-        "questions_fingerprint": sha256(bundle["questions"]), "bundle_fingerprint": sha256(bundle),
-        "model": model, "reasoning_effort": effort,
-    }
-    return sha256(material)
-
-
-def read_ledger(path: Path, mission_id: str) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    info = path.lstat()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        raise ConsultError("LEDGER_INVALID", ["ledger must be a regular non-symlink file"])
-    entries: list[dict[str, Any]] = []
-    try:
-        for line in path.read_text().splitlines():
-            item = json.loads(line)
-            if item.get("mission_id") == mission_id:
-                entries.append(item)
-    except (OSError, json.JSONDecodeError):
-        raise ConsultError("LEDGER_INVALID", ["ledger is unreadable or malformed"])
-    return entries
-
-
-def append_ledger(path: Path, entry: dict[str, Any]) -> None:
-    secure_dir(path.parent)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(path, flags, 0o600)
-    try:
-        with os.fdopen(fd, "a", encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            handle.write(json.dumps(entry, sort_keys=True) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-            fcntl.flock(handle, fcntl.LOCK_UN)
-    finally:
-        try: os.close(fd)
-        except OSError: pass
-    path.chmod(0o600)
-
-
-def acquire_mission_lock(ledger_path: Path, mission_id: str):
-    lock_dir = ledger_path.parent / ".codex-senior-consult-locks"
-    secure_dir(lock_dir)
-    lock_path = lock_dir / f"{safe_mission_id(mission_id)}.lock"
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    fd = os.open(lock_path, flags, 0o600)
-    handle = os.fdopen(fd, "r+")
-    fcntl.flock(handle, fcntl.LOCK_EX)
-    return handle
-
-
-def base_metrics(status: str, mission_id: str | None = None) -> dict[str, Any]:
-    return {
-        "status": status, "mission_id": mission_id, "superior_sessions": 0,
-        "codex_exec_processes": 0, "model_turns_observed": 0,
-        "backend_requests_observed": None, "tool_calls_observed": 0,
-        "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0,
-        "transport_retries": 0,
-    }
-
+def schema_errors(value: Any, schema: dict[str, Any], path: str = "$") -> list[str]:
+    errors: list[str] = []; typ = schema.get("type")
+    expected = {"object": dict, "array": list, "string": str, "boolean": bool}
+    if typ and (not isinstance(value, expected[typ]) or typ == "boolean" and not isinstance(value, bool)):
+        return [f"{path} has invalid type"]
+    if typ == "string":
+        if len(value) < schema.get("minLength", 0): errors.append(f"{path} must be non-empty")
+        if "enum" in schema and value not in schema["enum"]: errors.append(f"{path} invalid verdict")
+    if typ == "array":
+        if len(value) < schema.get("minItems", 0): errors.append(f"{path} has too few items")
+        if schema.get("uniqueItems") and len({json.dumps(item, sort_keys=True) for item in value}) != len(value): errors.append(f"{path} has duplicate items")
+        for index, item in enumerate(value): errors.extend(schema_errors(item, schema.get("items", {}), f"{path}[{index}]"))
+    if typ == "object":
+        properties = schema.get("properties", {}); missing = set(schema.get("required", ())) - set(value)
+        errors.extend(f"missing {path}.{key}" for key in sorted(missing))
+        if schema.get("additionalProperties") is False: errors.extend(f"additional property {path}.{key}" for key in sorted(set(value) - set(properties)))
+        for key, child in value.items():
+            if key in properties: errors.extend(schema_errors(child, properties[key], f"{path}.{key}"))
+    return errors
 
 def count_events(stdout: str) -> tuple[int, int, bool, list[str]]:
-    turns = 0
-    tools = 0
-    tool_ids: set[str] = set()
-    terminal = False
-    diagnostics: list[str] = []
-    threads = 0
-    terminals = 0
+    turns = tools = 0; terminal = False; diagnostics: list[str] = []; seen_tools: set[str] = set()
     for number, line in enumerate(stdout.splitlines(), 1):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            diagnostics.append(f"invalid JSONL event at line {number}")
-            continue
-        event_type = event.get("type")
-        known_events = {"thread.started", "turn.started", "turn.completed", "turn.failed",
-                        "item.started", "item.updated", "item.completed", "error"}
-        if event_type not in known_events and event_type not in TOOL_ITEM_TYPES:
-            diagnostics.append(f"unknown JSONL event type at line {number}")
-        if event_type == "thread.started": threads += 1
-        if event_type == "turn.started": turns += 1
-        if event_type == "turn.completed":
-            terminal = True
-            terminals += 1
-        if event_type in {"turn.failed", "error"}:
-            raw_error = event.get("error") or event.get("message") or "unspecified Codex error"
-            if isinstance(raw_error, dict):
-                raw_error = raw_error.get("message") or raw_error.get("code") or "structured Codex error"
-            safe_error = str(raw_error)[:500]
-            for pattern in SECRET_PATTERNS:
-                safe_error = pattern.sub("[REDACTED]", safe_error)
-            diagnostics.append(f"{event_type}: {safe_error}")
-        item = event.get("item") if isinstance(event, dict) else None
-        if (event_type in {"item.started", "item.updated", "item.completed"} and
-                (not isinstance(item, dict) or item.get("type") not in TOOL_ITEM_TYPES | NON_TOOL_ITEM_TYPES)):
-            diagnostics.append(f"unknown JSONL item type at line {number}")
-        if isinstance(item, dict) and item.get("type") in TOOL_ITEM_TYPES:
-            item_id = item.get("id")
-            if isinstance(item_id, str):
-                if item_id not in tool_ids:
-                    tool_ids.add(item_id)
-                    tools += 1
-            elif event_type == "item.started":
-                tools += 1
-        if event_type in TOOL_ITEM_TYPES: tools += 1
-    if stdout.strip() and threads != 1:
-        diagnostics.append(f"expected one thread.started event; observed {threads}")
-    if stdout.strip() and terminals != 1:
-        diagnostics.append(f"expected one turn.completed event; observed {terminals}")
-    return turns, tools, terminal, diagnostics
-
+        if not line.strip(): continue
+        try: event = json.loads(line)
+        except json.JSONDecodeError: diagnostics.append(f"invalid JSONL event at line {number}"); continue
+        typ = event.get("type")
+        if typ not in {"thread.started", "turn.started", "turn.completed", "turn.failed", "item.started", "item.updated", "item.completed", "error", *TOOL_ITEM_TYPES}: diagnostics.append(f"unknown JSONL event type at line {number}")
+        if typ == "turn.started": turns += 1
+        if typ == "turn.completed": terminal = True
+        item = event.get("item") if isinstance(event.get("item"), dict) else event
+        item_type = item.get("type") if isinstance(item, dict) else None
+        if item_type in TOOL_ITEM_TYPES:
+            ident = item.get("id", f"line-{number}"); seen_tools.add(str(ident))
+    return turns, len(seen_tools), terminal, diagnostics
 
 def child_environment() -> dict[str, str]:
-    allowed = ("PATH", "HOME", "CODEX_HOME", "LANG", "LC_ALL", "SSL_CERT_FILE", "SSL_CERT_DIR")
-    env = {key: os.environ[key] for key in allowed if key in os.environ}
+    # CODEX_HOME is deliberately the only authentication-bearing location that
+    # survives.  The CLI documents that --ignore-user-config still uses it for
+    # authentication; credentials and provider variables never cross this boundary.
+    keep = {"PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "CODEX_HOME"}
+    env = {k: v for k, v in os.environ.items() if k in keep}
     env["CODEX_SENIOR_CONSULT_ACTIVE"] = "1"
     return env
 
+def sanitize_stderr(stderr: str, limit: int = 400) -> str:
+    value = stderr
+    for pattern in SECRET_PATTERNS: value = pattern.sub("[REDACTED]", value)
+    value = re.sub(r"(?i)\b(authorization|password|passwd|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret)\s*[:=]\s*[^\s]+", r"\1=[REDACTED]", value)
+    value = re.sub(r"(?i)\bBearer\s+[^\s]+", "Bearer [REDACTED]", value)
+    value = re.sub(r"(?<![A-Za-z0-9_.-])/(?:[^\s'\"]+)", "[PRIVATE_PATH]", value)
+    return " ".join(value.split())[:limit]
+
+def transport_event_summary(stdout: str, limit: int = 4) -> list[str]:
+    summary: list[str] = []
+    for line in stdout.splitlines():
+        try: event = json.loads(line)
+        except json.JSONDecodeError: continue
+        if not isinstance(event, dict): continue
+        if event.get("type") == "error":
+            error = event.get("error", {})
+            code = error.get("code") if isinstance(error, dict) else None
+            message = error.get("message") if isinstance(error, dict) else event.get("message", "")
+            summary.append(f"jsonl error: {code}" if isinstance(code, str) and code else f"jsonl error: {sanitize_stderr(str(message), 240)}")
+        elif event.get("type") == "turn.failed": summary.append("turn.failed")
+        if len(summary) >= limit: break
+    return summary
+
+def classify_transport_failure(stderr: str, stdout: str = "") -> str:
+    events = transport_event_summary(stdout)
+    if any("invalid_json_schema" in item for item in events): return "SCHEMA_OR_REQUEST_REJECTION"
+    text = (stderr + "\n" + "\n".join(events)).casefold()
+    categories = (
+        ("CLI_ARGUMENT_ERROR", ("unknown option", "unrecognized option", "unexpected argument", "cannot be used multiple times", "invalid value for", "requires a value")),
+        ("AUTHENTICATION_ERROR", ("not logged in", "authentication", "login required", "unauthorized", "forbidden", "401", "403")),
+        ("MODEL_UNAVAILABLE", ("model unavailable", "model not found", "unknown model", "does not exist")),
+        ("RATE_LIMIT_OR_QUOTA", ("rate limit", "quota", "too many requests", "429")),
+        ("NETWORK_OR_SERVICE_ERROR", ("network", "connection", "connect", "dns", "service unavailable", "gateway", "timed out", "timeout", "502", "503", "504")),
+    )
+    return next((category for category, evidence in categories if any(marker in text for marker in evidence)), "UNKNOWN_TRANSPORT_ERROR")
+
+def sanitize_transport_stderr(stderr: str) -> str:
+    """Retain bounded transport diagnostics without exposing secrets or paths."""
+    value = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", stderr or "")
+    for pattern in SECRET_PATTERNS:
+        value = pattern.sub("[REDACTED]", value)
+    value = re.sub(r"(?<![A-Za-z0-9])(?:/home/[^\s]+|/tmp/[^\s]+)", "<path>", value)
+    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    return " | ".join(lines[-8:])[:1200]
 
 def run_process(command: list[str], prompt: str, timeout: int, cwd: Path) -> tuple[int, str, str, bool]:
-    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, cwd=cwd, env=child_environment(), start_new_session=True)
-    previous_handlers: dict[int, Any] = {}
-    def cancel_handler(signum, frame):
-        raise InterruptedError(f"received signal {signum}")
-    for signum in (signal.SIGINT, signal.SIGTERM):
-        previous_handlers[signum] = signal.getsignal(signum)
-        signal.signal(signum, cancel_handler)
+    proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, env=child_environment(), start_new_session=True)
     try:
         stdout, stderr = proc.communicate(prompt, timeout=timeout)
-        return proc.returncode, stdout, stderr, False
     except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            stdout, stderr = proc.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            stdout, stderr = proc.communicate()
-        return 124, stdout, stderr, True
-    except (InterruptedError, KeyboardInterrupt):
-        os.killpg(proc.pid, signal.SIGTERM)
-        try:
-            proc.communicate(timeout=2)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGKILL)
-            proc.communicate()
-        raise ConsultError("CANCELLED", ["codex exec process group terminated cleanly"])
-    finally:
-        for signum, previous in previous_handlers.items():
-            signal.signal(signum, previous)
+        os.killpg(proc.pid, signal.SIGKILL); proc.communicate(); return 124, "", "timeout", True
+    return proc.returncode, stdout, stderr, False
 
+def read_ledger(path: Path, mission: str) -> list[dict[str, Any]]:
+    if not path.exists(): return []
+    out = []
+    for line in path.read_text().splitlines():
+        try:
+            value = json.loads(line)
+            if value.get("mission_id") == mission: out.append(value)
+        except json.JSONDecodeError: raise ConsultError("LEDGER_CORRUPT", ["ledger contains invalid JSON"])
+    return out
 
-def ledger_entry(args: argparse.Namespace, *, session_number: int | None, cache: str,
-                 context_bytes: int, question_count: int, workspace_access: str,
-                 processes: int, turns: int, tools: int, retries: int, status: str,
-                 verdict: str | None, secret_exposure: bool = False) -> dict[str, Any]:
+def append_ledger(path: Path, entry: dict[str, Any]) -> None:
+    secure_dir(path.parent); with_path = path
+    if os.path.lexists(with_path) and stat.S_ISLNK(with_path.lstat().st_mode): raise ConsultError("INVALID_STATE_PATH", ["ledger cannot be symlinked"])
+    with with_path.open("a+", encoding="utf-8") as f:
+        os.chmod(with_path, 0o600); fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            for line in f:
+                try: existing = json.loads(line)
+                except json.JSONDecodeError: raise ConsultError("LEDGER_CORRUPT", ["ledger contains invalid JSON"])
+                if existing.get("execution_id") == entry.get("execution_id"):
+                    raise ConsultError("DUPLICATE_EXECUTION_REPLAY", ["execution_id already exists in ledger"])
+            f.seek(0, os.SEEK_END); f.write(json.dumps(entry, sort_keys=True) + "\n"); f.flush(); os.fsync(f.fileno()); _fsync_directory(with_path.parent)
+        finally: fcntl.flock(f, fcntl.LOCK_UN)
+
+def artifact_path(cache_dir: Path, fingerprint: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint): raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["invalid response artifact fingerprint"])
+    return cache_dir / "responses" / f"{fingerprint}.json"
+
+def identity_from_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    return {"snapshot": entry.get("snapshot"), "bundle": entry.get("normalized_bundle_fingerprint"), "mode": entry.get("mode"), "model": entry.get("model"), "effort": entry.get("reasoning_effort")}
+
+def response_answer_ids(response: dict[str, Any], legacy_ids: list[str]) -> list[str]:
+    if response.get("schema_version") == LEGACY_RESPONSE_SCHEMA:
+        answers = response.get("questions_answered")
+        return list(legacy_ids) if isinstance(answers, list) and len(answers) == len(legacy_ids) else []
+    answers = response.get("question_answers")
+    return [answer.get("id") for answer in answers if isinstance(answer, dict)] if isinstance(answers, list) else []
+
+def response_persistence_sensitive_locations(value: Any, path: str = "$") -> list[str]:
+    hits = secret_locations(value) + private_path_locations(value)
+    if isinstance(value, dict):
+        for key, child in value.items(): hits.extend(response_persistence_sensitive_locations(child, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for index, child in enumerate(value): hits.extend(response_persistence_sensitive_locations(child, f"{path}[{index}]"))
+    elif isinstance(value, str) and re.search(r"(?:^|\s)(?:/home/|/tmp/|/Users/|~(?:/|$))", value):
+        hits.append(path)
+    return sorted(set(hits))
+
+def _response_artifact_record(response: dict[str, Any], identity: dict[str, Any], question_answer_ids: list[str]) -> dict[str, Any]:
+    fingerprint = sha256(response)
+    return {"artifact_schema": RESPONSE_ARTIFACT_SCHEMA, "response_schema_version": response.get("schema_version"), "response_fingerprint": fingerprint, "identity": identity, "question_answer_ids": question_answer_ids, "response": response}
+
+def _read_artifact(path: Path, fingerprint: str, identity: dict[str, Any]) -> dict[str, Any]:
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("artifact is not a private regular file")
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["response evidence is missing or unreadable"]) from exc
+    if (not isinstance(value, dict) or value.get("artifact_schema") != RESPONSE_ARTIFACT_SCHEMA or
+            value.get("response_fingerprint") != fingerprint or value.get("identity") != identity or
+            not isinstance(value.get("response"), dict) or sha256(value["response"]) != fingerprint or
+            not isinstance(value.get("question_answer_ids"), list) or
+            value.get("question_answer_ids") != response_answer_ids(value["response"], value["question_answer_ids"])):
+        raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["response evidence fingerprint or identity mismatch"])
+    return value
+
+def persist_response_evidence(cache_dir: Path, response: dict[str, Any], identity: dict[str, Any], question_answer_ids: list[str]) -> dict[str, Any]:
+    if response_persistence_sensitive_locations(response):
+        raise ConsultError("VERDICT_PERSISTENCE_FAILURE", ["validated response contains sensitive material unsuitable for persistence"])
+    if question_answer_ids != response_answer_ids(response, question_answer_ids):
+        raise ConsultError("VERDICT_PERSISTENCE_FAILURE", ["validated response question-answer coverage changed before persistence"])
+    record = _response_artifact_record(response, identity, question_answer_ids)
+    fingerprint = record["response_fingerprint"]; path = artifact_path(cache_dir, fingerprint)
+    if path.exists():
+        _read_artifact(path, fingerprint, identity)
+    else:
+        secure_write(path, json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False))
+        _read_artifact(path, fingerprint, identity)
+    return {"relative_path": f"responses/{fingerprint}.json", "fingerprint": fingerprint, "artifact_schema": RESPONSE_ARTIFACT_SCHEMA}
+
+def read_persisted_response(cache_dir: Path, entry: dict[str, Any]) -> dict[str, Any]:
+    reference = entry.get("response_artifact")
+    if not isinstance(reference, dict): raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["historical verdict has no retained response payload"])
+    fingerprint = reference.get("fingerprint")
+    if (not isinstance(fingerprint, str) or reference.get("artifact_schema") != RESPONSE_ARTIFACT_SCHEMA or
+            reference.get("relative_path") != f"responses/{fingerprint}.json"):
+        raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["invalid response artifact reference"])
+    if entry.get("response_fingerprint") != fingerprint:
+        raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["ledger response fingerprint mismatch"])
+    return _read_artifact(artifact_path(cache_dir, fingerprint), fingerprint, identity_from_entry(entry))
+
+def commit_usable_verdict(ledger: Path, cache_dir: Path, entry: dict[str, Any], response: dict[str, Any], identity: dict[str, Any], question_answer_ids: list[str]) -> dict[str, Any]:
+    """Persist and verify canonical evidence before atomically appending a usable verdict."""
+    reference = persist_response_evidence(cache_dir, response, identity, question_answer_ids)
+    entry.update({"response_artifact": reference, "response_fingerprint": reference["fingerprint"],
+                  "response_schema_version": response.get("schema_version"), "question_answer_coverage": question_answer_ids,
+                  "model_response_validated": True, "validated_model_verdict": response.get("verdict"),
+                  "operational_usability": True})
+    # Re-read before the ledger commit: an entry is never appended as usable
+    # unless a post-rename reader can verify its exact canonical payload.
+    recovered = read_persisted_response(cache_dir, entry)
+    if recovered.get("response") != response: raise ConsultError("VERDICT_EVIDENCE_UNUSABLE", ["canonical response changed before ledger commit"])
+    append_ledger(ledger, entry)
+    return entry
+
+def acquire_lock(ledger: Path, mission: str):
+    secure_dir(ledger.parent); lock = ledger.parent / f".{safe_mission_id(mission)}.lock"; handle = lock.open("a+"); os.chmod(lock, 0o600); fcntl.flock(handle, fcntl.LOCK_EX); return handle
+
+def cache_key(bundle: dict[str, Any], model: str, effort: str) -> str: return sha256({"version": VERSION, "bundle": bundle, "model": model, "effort": effort})
+
+def base_metrics(status: str, mission: str) -> dict[str, Any]: return {"status": status, "mission_id": mission, "verdict": None, "details": [], "process_attempts": 0, "codex_exec_processes": 0, "superior_sessions": 0, "valid_verdicts": 0, "protocol_failures": 0, "replacement_attempts": 0, "cache_hits": 0, "transport_retries": 0}
+def emit(payload: dict[str, Any], code: int = 0) -> int: print(json.dumps(payload, sort_keys=True)); return code
+
+def evidence_state(cache_dir: Path, entry: dict[str, Any]) -> str:
+    if entry.get("verdict") is None: return "NO_MODEL_VERDICT"
+    if not entry.get("response_artifact"):
+        return "HISTORICAL_VALID_VERDICT_UNUSABLE"
+    try: read_persisted_response(cache_dir, entry)
+    except ConsultError: return "VERDICT_EVIDENCE_UNUSABLE"
+    return "VALID_ADVISORY_VERDICT"
+
+def evidence_reason(state: str | None) -> str | None:
     return {
-        "timestamp": utc_now(), "mission_id": args.mission_id, "mode": args.mode,
-        "session_number": session_number, "soft_budget": args.soft_budget, "hard_budget": args.hard_budget,
-        "cache": cache, "model": args.model, "reasoning_effort": args.effective_effort,
-        "effort_triggers": args.effort_triggers, "context_bytes": context_bytes,
-        "question_count": question_count, "workspace_access": workspace_access,
-        "codex_exec_processes": processes, "model_turns_observed": turns,
-        "backend_requests_observed": None, "tool_calls_observed": tools,
-        "follow_up_turns": max(0, turns - processes), "resume_operations": 0,
-        "automatic_repair_calls": 0, "automatic_transport_retries": retries,
-        "exit_status": status, "verdict": verdict, "secret_exposure": secret_exposure,
-    }
-
-
-def emit(payload: dict[str, Any], exit_code: int = 0) -> int:
-    print(json.dumps(payload, sort_keys=True))
-    return exit_code
-
+        "HISTORICAL_VALID_VERDICT_UNUSABLE": "response payload not retained by the historical execution",
+        "VERDICT_EVIDENCE_UNUSABLE": "referenced response evidence is missing, unreadable, or corrupt",
+    }.get(state)
 
 def status_report(args: argparse.Namespace) -> dict[str, Any]:
-    entries = read_ledger(Path(args.ledger), args.mission_id)
-    processes = sum(int(e.get("codex_exec_processes", 0)) for e in entries)
-    turns = sum(int(e.get("model_turns_observed", 0)) for e in entries)
-    tools = sum(int(e.get("tool_calls_observed", 0)) for e in entries)
-    followups = max(0, turns - processes)
-    resumes = sum(int(e.get("resume_operations", 0)) for e in entries)
-    repairs = sum(int(e.get("automatic_repair_calls", 0)) for e in entries)
-    transport_retries = sum(int(e.get("automatic_transport_retries", 0)) for e in entries)
-    cache_hits = sum(e.get("cache") == "HIT" for e in entries)
-    last = entries[-1] if entries else {}
-    return {
-        "status": "STATUS", "mission_id": args.mission_id, "sessions_used": processes,
-        "soft_sessions_remaining": max(0, args.soft_budget - processes),
-        "hard_sessions_remaining": max(0, args.hard_budget - processes),
-        "codex_exec_processes": processes, "model_turns_observed": turns,
-        "backend_requests_observed": None, "tool_calls_observed": tools,
-        "follow_up_turns": followups, "resume_operations": resumes,
-        "repair_executions": repairs, "transport_retries": transport_retries,
-        "cache_hits": cache_hits, "models": sorted({e.get("model") for e in entries if e.get("model")}),
-        "efforts": sorted({e.get("reasoning_effort") for e in entries if e.get("reasoning_effort")}),
-        "modes": sorted({e.get("mode") for e in entries if e.get("mode")}),
-        "last_verdict": last.get("verdict"),
-        "exit_statuses": sorted({e.get("exit_status") for e in entries if e.get("exit_status")}),
-    }
-
+    entries = read_ledger(Path(args.ledger), args.mission_id); cache_dir = Path(args.cache_dir).expanduser().resolve()
+    processes = sum(int(e.get("process_attempts", e.get("codex_exec_processes", 0))) for e in entries); verdicts = sum(1 for e in entries if e.get("verdict") is not None and e.get("cache") != "HIT"); failures = sum(1 for e in entries if e.get("protocol_failure")); replacements = sum(1 for e in entries if e.get("replacement_for")); hits = sum(e.get("cache") == "HIT" for e in entries); turns = sum(int(e.get("observed_model_turns", e.get("model_turns_observed", 0))) for e in entries); tools = sum(int(e.get("tool_calls_observed", 0)) for e in entries); retries = sum(int(e.get("transport_retries", e.get("automatic_transport_retries", 0))) for e in entries); last = entries[-1] if entries else {}; states = [evidence_state(cache_dir, entry) for entry in entries]
+    usable = sum(state == "VALID_ADVISORY_VERDICT" for state in states); unusable = sum(state in {"HISTORICAL_VALID_VERDICT_UNUSABLE", "VERDICT_EVIDENCE_UNUSABLE"} for state in states); last_state = states[-1] if states else None
+    return {"status": "STATUS", "mission_id": args.mission_id, "version": VERSION, "process_attempts": processes, "valid_verdicts": verdicts, "usable_valid_verdicts": usable, "unusable_valid_verdicts": unusable, "protocol_failures": failures, "replacement_attempts": replacements, "cache_hits": hits, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": processes, "model_turns_observed": turns, "backend_requests_observed": None, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "sessions_used": processes, "soft_sessions_remaining": max(0, args.soft_budget - verdicts), "hard_sessions_remaining": max(0, args.hard_budget - verdicts), "last_verdict": last.get("verdict") if last_state == "VALID_ADVISORY_VERDICT" else None, "last_validated_model_verdict": last.get("validated_model_verdict", last.get("verdict")), "last_operational_status": last_state, "last_operational_reason": evidence_reason(last_state), "exit_statuses": sorted({e.get("detailed_status") for e in entries if e.get("detailed_status")})}
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    state = Path.home() / ".local" / "state" / "codex-senior-consult"
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=sorted(MODES))
-    parser.add_argument("--mission-id", required=True)
-    parser.add_argument("--bundle")
-    parser.add_argument("--model", default="gpt-5.6-sol")
-    parser.add_argument("--effort", choices=sorted(EFFORTS), default="low")
-    parser.add_argument("--critical", action="append", choices=sorted(MEDIUM_TRIGGERS), default=[])
-    parser.add_argument("--workspace-read", metavar="DIR")
-    parser.add_argument("--workspace-read-justification")
-    parser.add_argument("--no-cache", action="store_true")
-    parser.add_argument("--refresh", action="store_true")
-    parser.add_argument("--timeout", type=int, default=180)
-    parser.add_argument("--transport-retries", type=int, choices=(0, 1), default=0)
-    parser.add_argument("--dangerous-yolo", action="store_true")
-    parser.add_argument("--ledger", default=str(state / "ledger.jsonl"))
-    parser.add_argument("--cache-dir", default=str(state / "cache"))
-    parser.add_argument("--max-bundle-bytes", type=int, default=131072)
-    parser.add_argument("--soft-budget", type=int, default=2)
-    parser.add_argument("--hard-budget", type=int, default=3)
-    parser.add_argument("--status", action="store_true")
-    parser.add_argument("--version", action="version", version=VERSION)
-    args = parser.parse_args(argv)
-    safe_mission_id(args.mission_id)
-    if args.status:
-        return args
-    if not args.mode or not args.bundle:
-        parser.error("--mode and --bundle are required unless --status is used")
-    if args.timeout < 1 or args.hard_budget < 1 or args.soft_budget < 0 or args.soft_budget > args.hard_budget:
-        parser.error("invalid timeout or mission budget")
-    if args.workspace_read and not args.workspace_read_justification:
-        parser.error("--workspace-read requires --workspace-read-justification")
-    return args
+    state = Path.home() / ".local" / "state" / "codex-senior-consult"; p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--mode", choices=sorted(MODES)); p.add_argument("--mission-id", required=True); p.add_argument("--bundle"); p.add_argument("--model", default="gpt-5.6-sol"); p.add_argument("--effort", choices=sorted(EFFORTS), default="low"); p.add_argument("--critical", action="append", choices=sorted(MEDIUM_TRIGGERS), default=[]); p.add_argument("--replacement-for"); p.add_argument("--legacy-response-v1", action="store_true"); p.add_argument("--status", action="store_true"); p.add_argument("--workspace-read"); p.add_argument("--workspace-read-justification"); p.add_argument("--no-cache", action="store_true"); p.add_argument("--refresh", action="store_true"); p.add_argument("--timeout", type=int, default=180); p.add_argument("--transport-retries", type=int, choices=(0, 1), default=0); p.add_argument("--dangerous-yolo", action="store_true"); p.add_argument("--ledger", default=str(state / "ledger.jsonl")); p.add_argument("--cache-dir", default=str(state / "cache")); p.add_argument("--max-bundle-bytes", type=int, default=131072); p.add_argument("--soft-budget", type=int, default=2); p.add_argument("--hard-budget", type=int, default=3); p.add_argument("--process-hard-budget", type=int); p.add_argument("--replacement-budget", type=int, default=1); return p.parse_args(argv)
 
+def build_prompt(bundle: dict[str, Any], model: str, effort: str) -> str:
+    mode = bundle["mode"]; return ("You are a bounded, single-pass senior consultant.\nUse only this supplied bundle. Do not use tools, inspect workspace, read files, execute commands, invoke MCP. Do not invoke subagents or other models. Do not ask follow-ups, resume, repair, or request another turn. Return exactly one final JSON object matching the mode contract. The wrapper owns identity metadata; do not reproduce it. Address every question by stable question id. A consultation execution may terminate fail-closed while the mission owner continues locally.\nMode: " + mode + "\nTarget model: " + model + "\nReasoning effort: " + effort + "\nBundle:\n" + json.dumps(bundle, sort_keys=True, ensure_ascii=False))
+
+def make_entry(args: argparse.Namespace, execution_id: str, identity: dict[str, Any], status: str, detailed: str, *, processes: int, turns: int, tools: int, verdict: str | None, replacement_for: str | None, cache: str = "MISS", protocol_failure: bool = False, retries: int = 0, transport: dict[str, Any] | None = None, model_response_validated: bool = False, validated_model_verdict: str | None = None) -> dict[str, Any]:
+    return {"execution_id": execution_id, "timestamp": utc_now(), "mission_id": args.mission_id, "mode": args.mode, "model": args.model, "reasoning_effort": getattr(args, "effective_effort", args.effort), "snapshot": identity["snapshot"], "normalized_bundle_fingerprint": identity["bundle"], "replacement_for": replacement_for, "replacement_authorized": bool(replacement_for), "cache": cache, "process_attempts": processes, "valid_verdicts": int(verdict is not None), "protocol_failure": bool(protocol_failure), "protocol_failures": int(protocol_failure), "replacement_attempts": int(bool(replacement_for)), "observed_model_turns": turns, "codex_exec_processes": processes, "model_turns_observed": turns, "tool_calls_observed": tools, "transport_retries": retries, "automatic_repair_calls": 0, "resume_operations": 0, "follow_up_turns": 0, "detailed_status": detailed, "status": status, "verdict": verdict, "model_response_validated": model_response_validated, "validated_model_verdict": validated_model_verdict, "operational_usability": bool(verdict is not None), "secret_exposure": False, **(transport or {})}
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        args = parse_args(argv)
-        if args.status:
-            return emit(status_report(args))
-        if os.environ.get("CODEX_SENIOR_CONSULT_ACTIVE") == "1":
-            return emit(base_metrics("RECURSIVE_ESCALATION_BLOCKED", args.mission_id), 2)
-        bundle_path, raw = read_regular_input(args.bundle, args.max_bundle_bytes)
+        args = parse_args(argv); safe_mission_id(args.mission_id)
+        if args.status: return emit(status_report(args))
+        if os.environ.get("CODEX_SENIOR_CONSULT_ACTIVE") == "1": return emit(base_metrics("RECURSIVE_ESCALATION_BLOCKED", args.mission_id), 2)
+        if not args.bundle or not args.mode: return emit(base_metrics("BUNDLE_INCOMPLETE", args.mission_id), 2)
+        _, raw = read_regular_input(args.bundle, args.max_bundle_bytes)
+        try: source = json.loads(raw)
+        except json.JSONDecodeError as exc: return emit({**base_metrics("BUNDLE_INCOMPLETE", args.mission_id), "details": [f"invalid JSON: {exc.msg}"]}, 2)
+        bundle = validate_and_prepare_bundle(source, args.mission_id, args.mode); args.effort_triggers = sorted(set(args.critical)); args.effective_effort = "medium" if args.effort in {"low", "medium"} and args.effort_triggers else args.effort; args.allow_legacy = args.legacy_response_v1 or bundle["requested_output"].get("schema_version") == LEGACY_RESPONSE_SCHEMA
+        if not bundle["escalation"].get("justified", True): return emit({**base_metrics("ESCALATION_NOT_JUSTIFIED", args.mission_id), "superior_sessions": 0, "codex_exec_processes": 0}, 0)
+        if args.workspace_read: return emit({**base_metrics("WORKSPACE_READ_UNSUPPORTED", args.mission_id), "details": ["workspace access cannot preserve zero tools"]}, 3)
+        if args.dangerous_yolo: return emit({**base_metrics("DANGEROUS_YOLO_DISABLED", args.mission_id), "details": ["dangerous bypass is disabled"]}, 3)
+        ledger = Path(args.ledger).expanduser().resolve(); cache_dir = Path(args.cache_dir).expanduser().resolve(); secure_dir(cache_dir); lock = acquire_lock(ledger, args.mission_id)
         try:
-            bundle = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            raise ConsultError("BUNDLE_INCOMPLETE", ["bundle must be valid UTF-8 JSON"])
-        bundle = validate_and_prepare_bundle(bundle, args.mission_id, args.mode)
-        gate = bundle.get("escalation", {})
-        reasons = escalation_reasons(bundle)
-        if not isinstance(gate, dict) or gate.get("justified") is not True or not reasons:
-            out = base_metrics("ESCALATION_NOT_JUSTIFIED", args.mission_id)
-            out["local_research_needed"] = [
-                "Use local reading, documentation, deterministic searches, tests, schemas, reproduction, diffs, logs, and approved contracts first."
-            ]
-            return emit(out, 3)
-        if args.workspace_read:
-            out = base_metrics("WORKSPACE_READ_UNSUPPORTED", args.mission_id)
-            out["details"] = [
-                "codex-cli 0.146.0 cannot expose workspace reads while preserving the zero-tool contract"
-            ]
-            return emit(out, 3)
-        if args.dangerous_yolo:
-            out = base_metrics("DANGEROUS_YOLO_DISABLED", args.mission_id)
-            out["details"] = ["danger-full-access is incompatible with this installed skill's safety contract"]
-            return emit(out, 3)
-        args.effort_triggers = sorted(set(args.critical))
-        args.effective_effort = args.effort
-        if args.effort in {"low", "medium"} and args.effort_triggers:
-            args.effective_effort = "medium"
-        ledger_path = Path(args.ledger).expanduser().resolve()
-        cache_dir = Path(args.cache_dir).expanduser().resolve()
-        secure_dir(cache_dir)
-        mission_lock = acquire_mission_lock(ledger_path, args.mission_id)
-        entries = read_ledger(ledger_path, args.mission_id)
-        sessions_used = sum(int(e.get("codex_exec_processes", 0)) for e in entries)
-        key = cache_key(bundle, args.model, args.effective_effort)
-        cache_path = cache_dir / f"{key}.json"
-        if not args.no_cache and not args.refresh and os.path.lexists(cache_path):
-            try:
-                cache_info = cache_path.lstat()
-                if stat.S_ISLNK(cache_info.st_mode) or not stat.S_ISREG(cache_info.st_mode):
-                    raise ValueError("cache entry is not a regular file")
-                cached = json.loads(cache_path.read_text())
-                cached_response = cached.get("response") if isinstance(cached, dict) else None
-                cache_errors = [] if isinstance(cached, dict) and cached.get("schema_version") == RESPONSE_SCHEMA else ["cache schema mismatch"]
-                cache_errors.extend(validate_response(
-                    cached_response, args.mission_id, args.mode, args.model,
-                    args.effective_effort, bundle["questions"],
-                    bundle["snapshot"]["repository_head"]))
-                if cache_errors:
-                    raise ValueError("; ".join(cache_errors))
-            except (OSError, ValueError, KeyError, json.JSONDecodeError):
-                out = base_metrics("CACHE_INVALID", args.mission_id)
-                out["details"] = ["cache entry failed local schema and integrity validation"]
-                return emit(out, 2)
-            out = base_metrics("CACHE_HIT", args.mission_id)
-            out.update({"cache": "HIT", "response": cached["response"], "model": args.model,
-                        "reasoning_effort": args.effective_effort, "question_count": len(bundle["questions"])})
-            entry = ledger_entry(args, session_number=None, cache="HIT", context_bytes=len(raw),
-                                 question_count=len(bundle["questions"]), workspace_access="none",
-                                 processes=0, turns=0, tools=0, retries=0, status="cache_hit",
-                                 verdict=cached["response"].get("verdict"))
-            append_ledger(ledger_path, entry)
-            return emit(out)
-        possible_processes = 1 + args.transport_retries
-        if sessions_used + possible_processes > args.hard_budget:
-            out = base_metrics("MISSION_BUDGET_EXCEEDED", args.mission_id)
-            out.update({"sessions_used": sessions_used, "hard_budget": args.hard_budget})
-            return emit(out, 4)
-        workspace_access = "none"
-        workspace: Path | None = None
-        prompt = build_prompt(bundle, args.model, args.effective_effort)
-        command_bin = "codex"
-        total_processes = total_turns = total_tools = retries = 0
-        final_text = ""
-        transport_stderr = ""
-        timed_out = False
-        terminal = False
-        jsonl_diagnostics: list[str] = []
-        with tempfile.TemporaryDirectory(prefix="codex-senior-work-") as work_name, tempfile.TemporaryDirectory(prefix="codex-senior-control-") as ctl_name:
-            work_dir = workspace or Path(work_name)
-            ctl_dir = Path(ctl_name)
-            schema_path = ctl_dir / "response.schema.json"
-            result_path = ctl_dir / "last-message.json"
-            secure_write(schema_path, json.dumps(response_schema(
-                args.mission_id, args.mode, args.model, args.effective_effort, len(bundle["questions"]),
-                bundle["snapshot"]["repository_head"])))
-            command = [command_bin]
-            if not args.dangerous_yolo:
-                command.extend(["--ask-for-approval", "never"])
-            command.extend(["exec", "-c", f'model_reasoning_effort="{args.effective_effort}"',
-                       "-c", "shell_environment_policy.inherit=none",
-                       "-m", args.model, "-C", str(work_dir), "--ephemeral", "--ignore-user-config",
-                       "--ignore-rules", "--output-schema", str(schema_path), "--json",
-                       "-o", str(result_path)])
-            if args.dangerous_yolo:
-                command.append("--dangerously-bypass-approvals-and-sandbox")
-            else:
-                command.extend(["--sandbox", "read-only"])
-            if workspace is None:
-                command.append("--skip-git-repo-check")
-            command.append("-")
-            attempts = 1 + args.transport_retries
-            for attempt in range(attempts):
-                total_processes += 1
-                reservation = ledger_entry(
-                    args, session_number=sessions_used + total_processes, cache="MISS",
-                    context_bytes=len(prompt.encode()), question_count=len(bundle["questions"]),
-                    workspace_access=workspace_access, processes=1, turns=0, tools=0,
-                    retries=1 if attempt else 0, status="started", verdict=None)
-                reservation["record_type"] = "session_reservation"
-                append_ledger(ledger_path, reservation)
-                exit_code, stdout, stderr, did_timeout = run_process(command, prompt, args.timeout, work_dir)
-                turns, tools_seen, completed, diag = count_events(stdout)
-                total_turns += turns
-                total_tools += tools_seen
-                terminal = terminal or completed
-                jsonl_diagnostics.extend(diag)
-                transport_stderr = stderr
-                timed_out = did_timeout
-                final_text = result_path.read_text() if result_path.is_file() else ""
-                response_observed = bool(final_text.strip()) or completed or turns > 0
-                if exit_code == 0 or response_observed or did_timeout or attempt + 1 == attempts:
-                    break
-                retries += 1
-        followups = max(0, total_turns - total_processes)
-        status = "completed"
-        response_value: dict[str, Any] | None = None
-        verdict: str | None = None
-        if timed_out:
-            status = "timeout"
-            public_status = "TIMEOUT"
-        elif not final_text.strip() or not terminal:
-            status = "transport_error"
-            public_status = "TRANSPORT_ERROR"
-        elif total_tools > 0 or total_turns != 1 or followups > 0 or jsonl_diagnostics:
-            status = "contract_violation"
-            public_status = "SINGLE_PASS_CONTRACT_VIOLATION"
-        else:
-            try:
-                parsed = normalize_json(final_text)
-                errors = validate_response(
-                    parsed, args.mission_id, args.mode, args.model, args.effective_effort, bundle["questions"],
-                    bundle["snapshot"]["repository_head"])
-                if errors:
-                    raise ConsultError("MALFORMED_SUPERIOR_RESPONSE", errors)
-                response_value = parsed
-                verdict = parsed["verdict"]
-                public_status = "COMPLETED"
-            except (json.JSONDecodeError, ConsultError) as error:
-                status = "malformed_response"
-                public_status = "MALFORMED_SUPERIOR_RESPONSE"
-                jsonl_diagnostics.extend(getattr(error, "details", []) or ["final response is not valid JSON"])
-        entry = ledger_entry(args, session_number=sessions_used + 1, cache="MISS", context_bytes=len(prompt.encode()),
-                             question_count=len(bundle["questions"]), workspace_access=workspace_access,
-                             processes=0, turns=total_turns, tools=total_tools, retries=retries,
-                             status=status, verdict=verdict)
-        entry["follow_up_turns"] = followups
-        entry["record_type"] = "consultation_result"
-        append_ledger(ledger_path, entry)
-        out = base_metrics(public_status, args.mission_id)
-        out.update({
-            "superior_sessions": total_processes, "codex_exec_processes": total_processes,
-            "model_turns_observed": total_turns, "tool_calls_observed": total_tools,
-            "follow_up_turns": followups, "transport_retries": retries,
-            "model": args.model, "reasoning_effort": args.effective_effort,
-            "effort_triggers": args.effort_triggers, "question_count": len(bundle["questions"]),
-            "cache": "MISS", "workspace_access": workspace_access,
-        })
-        if response_value is not None:
-            out["response"] = response_value
-            if not args.no_cache:
-                secure_dir(cache_dir)
-                secure_write(cache_path, json.dumps({"schema_version": RESPONSE_SCHEMA, "response": response_value}, sort_keys=True))
-        if jsonl_diagnostics:
-            out["diagnostics"] = jsonl_diagnostics
-        if transport_stderr:
-            print("codex exec diagnostics: " + transport_stderr.strip()[:2000], file=sys.stderr)
-        return emit(out, 0 if public_status in {"COMPLETED", "CACHE_HIT"} else 5)
-    except ConsultError as error:
-        out = base_metrics(error.code, getattr(locals().get("args", None), "mission_id", None))
-        out["details"] = error.details
-        return emit(out, 2)
+            entries = read_ledger(ledger, args.mission_id); identity = {"snapshot": sha256(bundle["snapshot"]), "bundle": bundle["normalized_bundle_fingerprint"], "mode": args.mode, "model": args.model, "effort": args.effective_effort}
+            replacement_for = args.replacement_for
+            if replacement_for:
+                prior = next((e for e in entries if e.get("execution_id") == replacement_for), None)
+                if not prior: return emit({**base_metrics("REPLACEMENT_NOT_AUTHORIZED", args.mission_id), "details": ["referenced execution does not exist"]}, 4)
+                if prior.get("verdict") is not None or prior.get("model_response_validated"):
+                    return emit({**base_metrics("REPLACEMENT_NOT_AUTHORIZED", args.mission_id), "details": ["validated model verdict cannot be replaced"]}, 4)
+                if prior.get("replacement_for"): return emit({**base_metrics("REPLACEMENT_NOT_AUTHORIZED", args.mission_id), "details": ["replacement of a replacement is forbidden"]}, 4)
+                if sum(1 for e in entries if e.get("replacement_for")) >= args.replacement_budget or any(e.get("replacement_for") == replacement_for for e in entries): return emit({**base_metrics("REPLACEMENT_NOT_AUTHORIZED", args.mission_id), "details": ["replacement allowance exhausted"]}, 4)
+                for key in ("mode", "model", "reasoning_effort"):
+                    if prior.get(key) != (args.mode if key == "mode" else args.model if key == "model" else args.effective_effort): return emit({**base_metrics("REPLACEMENT_NOT_AUTHORIZED", args.mission_id), "details": [f"{key} differs"]}, 4)
+                if prior.get("snapshot") != identity["snapshot"] or prior.get("normalized_bundle_fingerprint") != identity["bundle"]: return emit({**base_metrics("REPLACEMENT_NOT_AUTHORIZED", args.mission_id), "details": ["snapshot or normalized bundle differs"]}, 4)
+            key = cache_key(bundle, args.model, args.effective_effort); cache_path = cache_dir / f"{key}.json"
+            if not replacement_for and not args.no_cache and not args.refresh and os.path.lexists(cache_path):
+                try:
+                    info = cache_path.lstat(); cached = json.loads(cache_path.read_text())
+                    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or cached.get("schema_version") != RESPONSE_SCHEMA or cached.get("identity") != identity: raise ValueError
+                    errors = validate_response(cached.get("response"), args.mission_id, args.mode, args.model, args.effective_effort, bundle["questions"], bundle["snapshot"]["repository_head"], allow_legacy=args.allow_legacy)
+                    if errors: raise ValueError
+                except (OSError, ValueError, json.JSONDecodeError, AttributeError, TypeError): return emit({**base_metrics("CACHE_INVALID", args.mission_id), "details": ["cache entry failed schema or identity validation"]}, 2)
+                eid = str(uuid.uuid4()); cached_response = cached["response"]
+                entry = make_entry(args, eid, identity, "CACHE_HIT", "CACHE_HIT", processes=0, turns=0, tools=0, verdict=cached_response.get("verdict"), replacement_for=None, cache="HIT")
+                try:
+                    commit_usable_verdict(ledger, cache_dir, entry, cached_response, identity, question_ids(bundle))
+                except (ConsultError, OSError, ValueError):
+                    return emit({**base_metrics("NO_USABLE_VERDICT", args.mission_id), "detailed_status": "VERDICT_PERSISTENCE_FAILURE", "execution_id": eid, "model_response_validated": True, "validated_model_verdict": cached_response.get("verdict"), "details": ["validated cached response could not be retained"], "cache_hits": 1}, 2)
+                return emit({"status": "CACHE_HIT", "detailed_status": "VALID_ADVISORY_VERDICT", "mission_id": args.mission_id, "version": VERSION, "response": cached_response, "execution_id": eid, "replacement_for": None, "process_attempts": 0, "codex_exec_processes": 0, "superior_sessions": 0, "valid_verdicts": 0, "cache_hits": 1, "verdict": cached_response.get("verdict"), "response_fingerprint": entry["response_fingerprint"]})
+            process_budget = args.process_hard_budget if args.process_hard_budget is not None else (args.hard_budget if args.hard_budget != 3 else 4); used = sum(int(e.get("process_attempts", 0)) for e in entries); planned = 1 + args.transport_retries
+            if used + planned > process_budget or sum(1 for e in entries if e.get("verdict") is not None) >= args.hard_budget and not replacement_for: return emit({**base_metrics("MISSION_BUDGET_EXCEEDED", args.mission_id), "process_attempts": used, "valid_verdicts": sum(1 for e in entries if e.get("verdict") is not None)}, 4)
+            prompt = build_prompt(bundle, args.model, args.effective_effort); total_processes = turns = tools = retries = 0; final = None; detailed = "TRANSPORT_ERROR"; timeout = False; diagnostics: list[str] = []; transport: dict[str, Any] = {}
+            with tempfile.TemporaryDirectory(prefix="codex-senior-work-") as work, tempfile.TemporaryDirectory(prefix="codex-senior-control-") as ctl:
+                schema_file = Path(ctl) / "schema.json"; output_file = Path(ctl) / "response.json"; secure_write(schema_file, json.dumps(response_schema(mode=args.mode)))
+                command = ["codex", "--ask-for-approval", "never", "exec", "--ephemeral", "-C", work, "--sandbox", "read-only", "--json", "--output-schema", str(schema_file), "-o", str(output_file), "--ignore-user-config", "--ignore-rules", "-c", "shell_environment_policy.inherit=none", "--skip-git-repo-check", "-m", args.model, "-c", f'model_reasoning_effort="{args.effective_effort}"', "-"]
+                for attempt in range(1 + args.transport_retries):
+                    total_processes += 1; rc, stdout, stderr, timeout = run_process(command, prompt, args.timeout, Path(work)); t, tool_count, terminal, diagnostics = count_events(stdout); turns += t; tools += tool_count
+                    if timeout: detailed = "TIMEOUT"; break
+                    if rc != 0:
+                        detailed = "TRANSPORT_ERROR"
+                        transport = {"transport_exit_code": rc, "transport_category": classify_transport_failure(stderr, stdout), "stderr_summary": sanitize_stderr(stderr), "stderr_fingerprint": hashlib.sha256(stderr.encode()).hexdigest(), "transport_event_summary": transport_event_summary(stdout)}
+                        retries += int(attempt < args.transport_retries)
+                        continue
+                    if diagnostics or tools or turns != 1 or not terminal: detailed = "SINGLE_PASS_CONTRACT_VIOLATION"; break
+                    try: final = json.loads(output_file.read_text())
+                    except (OSError, json.JSONDecodeError): detailed = "MALFORMED_SUPERIOR_RESPONSE"; break
+                    errors = validate_response(final, args.mission_id, args.mode, args.model, args.effective_effort, bundle["questions"], bundle["snapshot"]["repository_head"], allow_legacy=args.allow_legacy)
+                    if errors: detailed = "MALFORMED_SUPERIOR_RESPONSE"; diagnostics = errors[:8]; final = None; break
+                    detailed = "VALID_ADVISORY_VERDICT"; break
+            eid = str(uuid.uuid4()); verdict = final.get("verdict") if final else None
+            if final:
+                entry = make_entry(args, eid, identity, "COMPLETED", "VALID_ADVISORY_VERDICT", processes=total_processes, turns=turns, tools=tools, verdict=verdict, replacement_for=replacement_for, retries=retries, transport=transport)
+                try:
+                    commit_usable_verdict(ledger, cache_dir, entry, final, identity, question_ids(bundle))
+                except (ConsultError, OSError, ValueError):
+                    # A semantically valid model response that cannot be durably
+                    # retained is not an actionable advisory verdict.  Do not leak
+                    # its payload or convert it into a retry/replacement signal.
+                    failed = make_entry(args, eid, identity, "NO_USABLE_VERDICT", "VERDICT_PERSISTENCE_FAILURE", processes=total_processes, turns=turns, tools=tools, verdict=None, replacement_for=replacement_for, retries=retries, transport=transport, model_response_validated=True, validated_model_verdict=verdict)
+                    try: append_ledger(ledger, failed)
+                    except (ConsultError, OSError, ValueError): pass
+                    out = {"status": "NO_USABLE_VERDICT", "detailed_status": "VERDICT_PERSISTENCE_FAILURE", "mission_id": args.mission_id, "version": VERSION, "execution_id": eid, "replacement_for": replacement_for, "response": None, "verdict": None, "model_response_validated": True, "validated_model_verdict": verdict, "operational_usability": False, "process_attempts": total_processes, "valid_verdicts": 0, "protocol_failures": 0, "replacement_attempts": int(bool(replacement_for)), "cache_hits": 0, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": total_processes, "superior_sessions": total_processes, "question_count": len(bundle["questions"]), "reasoning_effort": args.effective_effort, "effort_triggers": args.effort_triggers, "backend_requests_observed": None, "model_turns_observed": turns, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "details": ["validated response could not be durably retained"], **transport}
+                    return emit(out, 2)
+                if not args.no_cache:
+                    try: secure_write(cache_path, json.dumps({"schema_version": RESPONSE_SCHEMA, "identity": identity, "response": final}))
+                    except (ConsultError, OSError): pass
+                out = {"status": "COMPLETED", "detailed_status": "VALID_ADVISORY_VERDICT", "mission_id": args.mission_id, "version": VERSION, "execution_id": eid, "replacement_for": replacement_for, "response": final, "verdict": verdict, "response_fingerprint": entry["response_fingerprint"], "response_artifact": entry["response_artifact"], "operational_usability": True, "process_attempts": total_processes, "valid_verdicts": 1, "protocol_failures": 0, "replacement_attempts": int(bool(replacement_for)), "cache_hits": 0, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": total_processes, "superior_sessions": total_processes, "question_count": len(bundle["questions"]), "reasoning_effort": args.effective_effort, "effort_triggers": args.effort_triggers, "backend_requests_observed": None, "model_turns_observed": turns, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "details": diagnostics, **transport}
+                return emit(out)
+            status = "NO_VERDICT_PROTOCOL_FAILURE"; entry = make_entry(args, eid, identity, status, detailed, processes=total_processes, turns=turns, tools=tools, verdict=None, replacement_for=replacement_for, retries=retries, protocol_failure=True, transport=transport); append_ledger(ledger, entry)
+            out = {"status": status, "detailed_status": detailed, "mission_id": args.mission_id, "version": VERSION, "execution_id": eid, "replacement_for": replacement_for, "response": None, "verdict": None, "process_attempts": total_processes, "valid_verdicts": 0, "protocol_failures": 1, "replacement_attempts": int(bool(replacement_for)), "cache_hits": 0, "transport_retries": retries, "observed_model_turns": turns, "codex_exec_processes": total_processes, "superior_sessions": total_processes, "question_count": len(bundle["questions"]), "reasoning_effort": args.effective_effort, "effort_triggers": args.effort_triggers, "backend_requests_observed": None, "model_turns_observed": turns, "tool_calls_observed": tools, "follow_up_turns": 0, "resume_operations": 0, "repair_executions": 0, "details": diagnostics, **transport}
+            return emit(out, 2)
+        finally: fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
+    except ConsultError as exc: return emit({**base_metrics(exc.code, args.mission_id if 'args' in locals() else "unknown"), "details": exc.details}, 2)
+    except (OSError, subprocess.SubprocessError) as exc: return emit({"status": "TRANSPORT_ERROR", "details": [str(exc)[:300]], "verdict": None}, 2)
 
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+if __name__ == "__main__": raise SystemExit(main())

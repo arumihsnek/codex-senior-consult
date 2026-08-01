@@ -1,12 +1,16 @@
 import importlib.util
 import json
+import jsonschema
 import os
 from pathlib import Path
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -85,7 +89,38 @@ def response(mission_id="mission-1", mode="integrated-review", confidence="high"
     return value
 
 
-def write_fake_codex(path, payload, *, tool=False, malformed=False, fail_transport=False, sleep_seconds=0):
+def v2_response(mode, question_ids=("Q1",)):
+    answers = [{"id": question_id, "answer": "Addressed from the frozen evidence."}
+               for question_id in question_ids]
+    payloads = {
+        "merge-gate": {"verdict": "accept", "safe_to_merge": True,
+                       "blocking_findings": [], "required_actions": [],
+                       "residual_risks": [], "summary": "Safe to merge."},
+        "blocker-analysis": {"verdict": "continue", "ranked_causes": [],
+                             "continuation_paths": [], "recommended_path": "Inspect local evidence.",
+                             "cheapest_discriminating_experiment": "Run the focused check.",
+                             "stop_conditions": [], "next_safe_step": "Run the focused check."},
+        "replan": {"verdict": "continue", "invalidated_assumptions": [], "plan_delta": [],
+                   "closed_phases_preserved": [], "new_stop_conditions": [],
+                   "next_safe_step": "Keep the closed phase."},
+        "integrated-review": {"verdict": "accept", "summary": "Evidence is consistent.",
+                              "findings": [], "decision": {"recommendation": "continue", "rationale": "Evidence supports it."},
+                              "next_safe_step": "Continue locally."},
+        "plan": {"verdict": "continue", "summary": "The bounded plan is sufficient.",
+                 "plan": {"steps": ["Run the focused check."], "stop_conditions": []},
+                 "risks": [], "next_safe_step": "Run the focused check."},
+        "plan-review": {"verdict": "accept", "summary": "The plan is acceptable.",
+                        "blocking_findings": [], "required_actions": [], "next_safe_step": "Execute the plan."},
+        "risk-audit": {"verdict": "continue", "risks": [], "controls": [],
+                       "residual_risks": [], "next_safe_step": "Maintain controls."},
+        "final-review": {"verdict": "accept", "claim_classifications": [],
+                         "summary": "Claims are supported.", "next_safe_step": "Use the merge gate."},
+    }
+    return {"schema_version": "codex-senior-consult-response/v2", "question_answers": answers,
+            **payloads[mode]}
+
+
+def write_fake_codex(path, payload, *, tool=False, malformed=False, fail_transport=False, stderr_text="transport unavailable", sleep_seconds=0):
     final = "{not-json" if malformed else json.dumps(payload)
     events = [
         {"type": "thread.started", "thread_id": "t-1"},
@@ -107,15 +142,16 @@ stdin_counter = pathlib.Path(os.environ['FAKE_STDIN_COUNTER'])
 stdin_counter.write_text(str(int(stdin_counter.read_text() or '0') + 1))
 prompt = sys.stdin.read()
 pathlib.Path(os.environ['FAKE_PROMPT']).write_text(prompt)
+pathlib.Path(%r).write_text(json.dumps(dict(os.environ), sort_keys=True))
 if %r:
-    print('transport unavailable', file=sys.stderr)
+    print(%r, file=sys.stderr)
     raise SystemExit(75)
 events = %r
 for event in events:
     print(json.dumps(event), flush=True)
 out = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])
 out.write_text(%r)
-""" % (sleep_seconds, fail_transport, events, final)
+""" % (sleep_seconds, str(path.parent / "env"), fail_transport, stderr_text, events, final)
     code = code.replace("pathlib.Path(os.environ['FAKE_COUNTER'])", f"pathlib.Path({str(path.parent / 'counter')!r})")
     code = code.replace("pathlib.Path(os.environ['FAKE_ARGV'])", f"pathlib.Path({str(path.parent / 'argv')!r})")
     code = code.replace("pathlib.Path(os.environ['FAKE_STDIN_COUNTER'])", f"pathlib.Path({str(path.parent / 'stdin-counter')!r})")
@@ -154,6 +190,19 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_text(%r)
 
 
 class ConsultProductTests(unittest.TestCase):
+    def test_transport_stderr_is_bounded_and_redacted(self):
+        module = load_module()
+        value = module.sanitize_transport_stderr(
+            "fatal /home/ubuntu/.codex/config.toml sk-abcdefghijklmnopqrstuvwxyz\n"
+            "Bearer abcdefghijklmnop\n"
+            "permission denied /tmp/codex-senior-work-123"
+        )
+        self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz", value)
+        self.assertNotIn("Bearer abcdefghijklmnop", value)
+        self.assertNotIn("/home/ubuntu", value)
+        self.assertNotIn("/tmp/codex-senior-work-123", value)
+        self.assertLessEqual(len(value), 1200)
+
     @classmethod
     def setUpClass(cls):
         cls.mod = load_module()
@@ -169,18 +218,144 @@ class ConsultProductTests(unittest.TestCase):
         self.stdin_counter = self.base / "stdin-counter"
         self.prompt = self.base / "prompt"
         self.argv_log = self.base / "argv"
+        self.env_log = self.base / "env"
         self.counter.write_text("0")
         self.stdin_counter.write_text("0")
 
-    def test_response_schema_const_properties_declare_json_types(self):
+    def test_response_schema_declares_only_focused_v2_payload_properties(self):
         schema = self.mod.response_schema("mission-1", "merge-gate", "gpt-5.6-sol", "medium", 1, "a" * 40)
-        for name in ("schema_version", "mission_id", "mode", "model", "reasoning_effort", "snapshot"):
+        for name in ("schema_version", "verdict"):
             self.assertEqual(schema["properties"][name]["type"], "string")
+        self.assertEqual(schema["properties"]["question_answers"]["type"], "array")
+        self.assertNotIn("mission_id", schema["properties"])
 
-    def test_response_schema_requires_exact_snapshot(self):
+    def test_response_schema_does_not_require_wrapper_metadata(self):
         schema = self.mod.response_schema("mission-1", "merge-gate", "gpt-5.6-sol", "medium", 1, "a" * 40)
-        self.assertIn("snapshot", schema["required"])
-        self.assertEqual(schema["properties"]["snapshot"]["const"], "a" * 40)
+        self.assertNotIn("snapshot", schema["required"])
+        self.assertNotIn("snapshot", schema["properties"])
+
+    def test_v2_output_schemas_omit_codex_rejected_unique_items_keyword(self):
+        def keys(value):
+            if isinstance(value, dict):
+                return set(value) | set().union(*(keys(child) for child in value.values()))
+            if isinstance(value, list):
+                return set().union(*(keys(child) for child in value)) if value else set()
+            return set()
+        for mode in self.mod.MODES:
+            self.assertNotIn("uniqueItems", keys(self.mod.response_schema(mode=mode)), mode)
+
+    def test_transport_schemas_use_only_the_conservative_backend_allowlist(self):
+        allowlist = {"type", "properties", "required", "additionalProperties", "items", "enum", "description"}
+
+        def keywords(value, property_map=False):
+            if isinstance(value, dict):
+                found = set() if property_map else set(value)
+                for key, child in value.items():
+                    found |= keywords(child, key == "properties")
+                return found
+            if isinstance(value, list):
+                return set().union(*(keywords(child) for child in value)) if value else set()
+            return set()
+
+        for mode in self.mod.MODES:
+            self.assertTrue(keywords(self.mod.backend_transport_schema(mode)).issubset(allowlist), mode)
+
+    def test_transport_strict_objects_require_every_declared_property(self):
+        def violations(schema):
+            found = []
+            if isinstance(schema, dict):
+                properties = schema.get("properties")
+                if isinstance(properties, dict) and schema.get("additionalProperties") is False:
+                    if set(schema.get("required", ())) != set(properties):
+                        found.append(sorted(set(properties) - set(schema.get("required", ()))))
+                for child in schema.values():
+                    found.extend(violations(child))
+            elif isinstance(schema, list):
+                for child in schema:
+                    found.extend(violations(child))
+            return found
+
+        for mode in self.mod.MODES:
+            self.assertEqual(violations(self.mod.backend_transport_schema(mode)), [], mode)
+
+    def test_transport_contracts_exclude_conditional_singular_fields(self):
+        def property_names(schema):
+            found = set()
+            if isinstance(schema, dict):
+                if isinstance(schema.get("properties"), dict):
+                    found |= set(schema["properties"])
+                for child in schema.values():
+                    found |= property_names(child)
+            elif isinstance(schema, list):
+                for child in schema:
+                    found |= property_names(child)
+            return found
+
+        for mode in self.mod.MODES:
+            names = property_names(self.mod.backend_transport_schema(mode))
+            self.assertNotIn("required_change", names, mode)
+            self.assertNotIn("control", names, mode)
+
+    def test_merge_gate_blocked_requires_blocking_evidence(self):
+        payload = v2_response("merge-gate", ("Q1",))
+        blocked = dict(payload, verdict="blocked", safe_to_merge=False,
+                       blocking_findings=[], required_actions=["Stop the release."])
+        self.assertTrue(self.mod.validate_response(blocked, "m", "merge-gate", "model", "low",
+                                                   [{"id": "Q1", "text": "Question"}], "a" * 40))
+
+    def test_accept_like_verdicts_reject_findings_or_actions(self):
+        questions = [{"id": "Q1", "text": "Question"}]
+        finding = {"id": "F-1", "claim": "Unexpected change", "severity": "blocking",
+                   "evidence": ["Observed in the supplied diff."], "reasoning_summary": "Requires review."}
+        plan_review = dict(v2_response("plan-review", ("Q1",)), required_actions=["Change the plan."])
+        integrated = dict(v2_response("integrated-review", ("Q1",)), findings=[finding])
+        self.assertTrue(self.mod.validate_response(plan_review, "m", "plan-review", "model", "low", questions, "a" * 40))
+        self.assertTrue(self.mod.validate_response(integrated, "m", "integrated-review", "model", "low", questions, "a" * 40))
+
+    def test_canonical_response_for_every_mode_verdict_passes_both_layers(self):
+        questions = [{"id": "Q1", "text": "Question"}]
+        finding = {"id": "F-1", "claim": "Blocking evidence", "severity": "blocking",
+                   "evidence": ["Supplied evidence."], "reasoning_summary": "The gate cannot proceed."}
+        for mode, contract in self.mod.MODE_CONTRACTS.items():
+            for verdict in contract["verdicts"]:
+                payload = v2_response(mode, ("Q1",))
+                payload["verdict"] = verdict
+                if mode == "merge-gate" and verdict != "accept":
+                    payload["safe_to_merge"] = False
+                    payload["blocking_findings"] = [finding]
+                transport = jsonschema.Draft202012Validator(self.mod.backend_transport_schema(mode))
+                self.assertFalse(list(transport.iter_errors(payload)), f"transport {mode} {verdict}")
+                self.assertEqual(self.mod.validate_response(payload, "m", mode, "model", "low", questions, "a" * 40), [],
+                                 f"local {mode} {verdict}")
+
+    def test_invalid_json_schema_jsonl_event_is_a_schema_request_rejection(self):
+        stream = "\n".join(json.dumps(event) for event in [
+            {"type": "thread.started", "thread_id": "t-1"},
+            {"type": "turn.started"},
+            {"type": "error", "error": {"type": "invalid_request_error", "code": "invalid_json_schema",
+             "message": "Invalid schema for response_format"}, "status": 400},
+            {"type": "turn.failed"},
+        ])
+        self.assertEqual(self.mod.classify_transport_failure("", stream), "SCHEMA_OR_REQUEST_REJECTION")
+        self.assertEqual(self.mod.transport_event_summary(stream), ["jsonl error: invalid_json_schema", "turn.failed"])
+
+    def test_local_semantics_remain_stricter_than_transport_shape(self):
+        payload = v2_response("merge-gate", ("Q1",))
+        transport = jsonschema.Draft202012Validator(self.mod.backend_transport_schema("merge-gate"))
+        questions = [{"id": "Q1", "text": "Question"}]
+        for invalid in (
+            dict(payload, question_answers=[{"id": "Q1", "answer": ""}]),
+            dict(payload, question_answers=[{"id": "Q1", "answer": "yes"}, {"id": "Q1", "answer": "again"}]),
+            dict(payload, question_answers=[]),
+            dict(payload, verdict="not-a-verdict"),
+            dict(payload, safe_to_merge=False),
+            dict(payload, verdict="changes_required", safe_to_merge=False,
+                 blocking_findings=[], required_actions=[]),
+        ):
+            self.assertTrue(self.mod.validate_response(invalid, "m", "merge-gate", "model", "low", questions, "a" * 40))
+        self.assertFalse(list(transport.iter_errors(dict(payload, question_answers=[{"id": "Q1", "answer": ""}]))))
+        self.assertTrue(list(transport.iter_errors(dict(payload, unexpected="no"))))
+        self.assertTrue(list(transport.iter_errors(dict(payload, safe_to_merge="yes"))))
 
     def test_validate_response_rejects_snapshot_mismatch(self):
         valid = response(mode="merge-gate", snapshot="a" * 40)
@@ -209,7 +384,7 @@ class ConsultProductTests(unittest.TestCase):
         env.pop("CODEX_SENIOR_CONSULT_ACTIVE", None)
         return env
 
-    def invoke(self, bundle, payload=None, extra=None, **fake_options):
+    def invoke(self, bundle, payload=None, extra=None, child_env=None, **fake_options):
         self.bundle_path.write_text(json.dumps(bundle))
         fake = self.base / "codex"
         write_fake_codex(fake, payload or response(bundle["mission_id"], bundle["mode"]), **fake_options)
@@ -218,7 +393,10 @@ class ConsultProductTests(unittest.TestCase):
                "--ledger", str(self.ledger), "--cache-dir", str(self.cache)]
         if extra:
             cmd.extend(extra)
-        return subprocess.run(cmd, text=True, capture_output=True, env=self.env_for(fake), timeout=10)
+        env = self.env_for(fake)
+        if child_env:
+            env.update(child_env)
+        return subprocess.run(cmd, text=True, capture_output=True, env=env, timeout=10)
 
     def parsed(self, proc):
         return json.loads(proc.stdout)
@@ -248,6 +426,69 @@ class ConsultProductTests(unittest.TestCase):
         argv = json.loads(self.argv_log.read_text())
         self.assertLess(argv.index("--ask-for-approval"), argv.index("exec"))
         self.assertIn("shell_environment_policy.inherit=none", argv)
+
+    def test_cli_contract_binds_requested_model_effective_effort_and_single_output_file(self):
+        payload = response()
+        payload["model"] = "requested-model"
+        payload["reasoning_effort"] = "medium"
+        proc = self.invoke(complete_bundle(), payload=payload, extra=["--model", "requested-model", "--critical", "credentials"],
+                           child_env={"CODEX_HOME": "/isolated/auth-home", "OPENAI_API_KEY": "secret-value",
+                                      "ANTHROPIC_API_KEY": "other-secret", "AUTHORIZATION": "Bearer value"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        argv = json.loads(self.argv_log.read_text())
+        self.assertEqual(argv[argv.index("-m") + 1], "requested-model")
+        self.assertEqual(argv[argv.index("-c", argv.index("-m")) + 1], 'model_reasoning_effort="medium"')
+        self.assertEqual(sum(arg in {"-o", "--output-last-message"} for arg in argv), 1)
+        child = json.loads(self.env_log.read_text())
+        self.assertEqual(child.get("CODEX_HOME"), "/isolated/auth-home")
+        self.assertNotIn("OPENAI_API_KEY", child)
+        self.assertNotIn("ANTHROPIC_API_KEY", child)
+        self.assertNotIn("AUTHORIZATION", child)
+        self.assertTrue(set(child).issubset({"PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "CODEX_HOME", "CODEX_SENIOR_CONSULT_ACTIVE"}))
+
+    def test_transport_failure_retains_sanitized_actionable_diagnostics(self):
+        proc = self.invoke(complete_bundle(), fail_transport=True,
+                           stderr_text="network connection reset token=sk-abcdefghijklmnopqrstuvwxyz123456 /private/project",
+                           child_env={"OPENAI_API_KEY": "sk-abcdefghijklmnopqrstuvwxyz123456"})
+        out = self.parsed(proc)
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "TRANSPORT_ERROR"))
+        self.assertEqual(out["transport_exit_code"], 75)
+        self.assertEqual(out["transport_category"], "NETWORK_OR_SERVICE_ERROR")
+        self.assertTrue(out["stderr_summary"])
+        self.assertNotIn("sk-", out["stderr_summary"])
+        self.assertNotIn("/private/project", out["stderr_summary"])
+        self.assertTrue(out["stderr_fingerprint"])
+
+    def test_every_v2_mode_has_schema_and_local_validator_parity(self):
+        for mode in sorted(self.mod.MODES):
+            payload = v2_response(mode)
+            schema = self.mod.response_schema(mode=mode)
+            validator = jsonschema.Draft202012Validator(schema)
+            checks = {
+                "canonical": payload,
+                "wrong_type": dict(payload, verdict=[]),
+                "extra": dict(payload, unexpected="no"),
+                "missing": {key: value for key, value in payload.items() if key != "verdict"},
+                "invalid_verdict": dict(payload, verdict="not-a-verdict"),
+            }
+            for name, candidate in checks.items():
+                schema_ok = not list(validator.iter_errors(candidate))
+                local_ok = not self.mod.validate_response(candidate, "m", mode, "model", "low",
+                                                           [{"id": "Q1", "text": "Question"}], "a" * 40)
+                self.assertEqual(schema_ok, local_ok, f"{mode} {name}")
+                self.assertEqual(schema_ok, name == "canonical", f"{mode} {name}")
+
+    def test_v2_question_answers_require_exact_unique_known_ids_and_nonempty_answers(self):
+        payload = v2_response("merge-gate", ("Q1", "Q2"))
+        questions = [{"id": "Q1", "text": "One"}, {"id": "Q2", "text": "Two"}]
+        self.assertEqual(self.mod.validate_response(payload, "m", "merge-gate", "model", "low", questions, "a" * 40), [])
+        for answers in (
+            [{"id": "Q1", "answer": "Yes"}],
+            [{"id": "Q1", "answer": "Yes"}, {"id": "Q1", "answer": "Again"}],
+            [{"id": "Q1", "answer": "Yes"}, {"id": "Q3", "answer": "Unknown"}],
+            [{"id": "Q1", "answer": ""}, {"id": "Q2", "answer": "Yes"}],
+        ):
+            self.assertTrue(self.mod.validate_response(dict(payload, question_answers=answers), "m", "merge-gate", "model", "low", questions, "a" * 40))
 
     def test_six_related_questions_are_grouped_into_one_session(self):
         questions = [f"Q{i}: Is risk {i} controlled?" for i in range(1, 7)]
@@ -295,7 +536,7 @@ class ConsultProductTests(unittest.TestCase):
     def test_malformed_response_has_no_repair_call(self):
         proc = self.invoke(complete_bundle(), malformed=True)
         out = self.parsed(proc)
-        self.assertEqual(out["status"], "MALFORMED_SUPERIOR_RESPONSE")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "MALFORMED_SUPERIOR_RESPONSE"))
         self.assertEqual(out["repair_executions"], 0)
         self.assertEqual(self.counter.read_text(), "1")
 
@@ -310,7 +551,7 @@ class ConsultProductTests(unittest.TestCase):
     def test_tool_call_is_contract_violation_without_relaunch(self):
         proc = self.invoke(complete_bundle(), tool=True)
         out = self.parsed(proc)
-        self.assertEqual(out["status"], "SINGLE_PASS_CONTRACT_VIOLATION")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "SINGLE_PASS_CONTRACT_VIOLATION"))
         self.assertEqual(out["tool_calls_observed"], 1)
         self.assertEqual(self.counter.read_text(), "1")
 
@@ -330,7 +571,7 @@ class ConsultProductTests(unittest.TestCase):
         payload["unexpected"] = "must not be accepted"
         proc = self.invoke(complete_bundle(), payload=payload)
         out = self.parsed(proc)
-        self.assertEqual(out["status"], "MALFORMED_SUPERIOR_RESPONSE")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "MALFORMED_SUPERIOR_RESPONSE"))
         self.assertEqual(out["repair_executions"], 0)
 
     def test_invalid_finding_types_and_container_severity_are_malformed(self):
@@ -340,7 +581,7 @@ class ConsultProductTests(unittest.TestCase):
             "evidence": "not-an-array", "reasoning_summary": "bad", "required_change": 42,
         }]
         out = self.parsed(self.invoke(complete_bundle(), payload=payload))
-        self.assertEqual(out["status"], "MALFORMED_SUPERIOR_RESPONSE")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "MALFORMED_SUPERIOR_RESPONSE"))
 
     def test_merge_gate_verdict_safe_flag_and_blockers_must_be_consistent(self):
         bundle = complete_bundle(mode="merge-gate")
@@ -351,7 +592,7 @@ class ConsultProductTests(unittest.TestCase):
             "required_change": "Supply runtime proof",
         }]
         out = self.parsed(self.invoke(bundle, payload=payload))
-        self.assertEqual(out["status"], "MALFORMED_SUPERIOR_RESPONSE")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "MALFORMED_SUPERIOR_RESPONSE"))
 
     def test_invalid_jsonl_fails_closed_as_contract_violation(self):
         bundle = complete_bundle()
@@ -365,7 +606,8 @@ class ConsultProductTests(unittest.TestCase):
              "--mode", bundle["mode"], "--mission-id", bundle["mission_id"],
              "--ledger", str(self.ledger), "--cache-dir", str(self.cache)],
             text=True, capture_output=True, env=self.env_for(fake), timeout=10)
-        self.assertEqual(self.parsed(proc)["status"], "SINGLE_PASS_CONTRACT_VIOLATION")
+        parsed = self.parsed(proc)
+        self.assertEqual((parsed["status"], parsed["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "SINGLE_PASS_CONTRACT_VIOLATION"))
 
     def test_corrupt_cache_is_rejected_without_exec(self):
         bundle = complete_bundle()
@@ -394,7 +636,7 @@ class ConsultProductTests(unittest.TestCase):
         questions = [f"Q{i}: Is risk {i} controlled?" for i in range(1, 7)]
         proc = self.invoke(complete_bundle(questions=questions), payload=response())
         out = self.parsed(proc)
-        self.assertEqual(out["status"], "MALFORMED_SUPERIOR_RESPONSE")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "MALFORMED_SUPERIOR_RESPONSE"))
         self.assertEqual(self.counter.read_text(), "1")
 
     def test_recursion_is_blocked_before_exec(self):
@@ -426,7 +668,7 @@ class ConsultProductTests(unittest.TestCase):
     def test_transport_retry_requires_explicit_flag_and_counts_execution(self):
         proc = self.invoke(complete_bundle(), fail_transport=True)
         out = self.parsed(proc)
-        self.assertEqual(out["status"], "TRANSPORT_ERROR")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "TRANSPORT_ERROR"))
         self.assertEqual(out["transport_retries"], 0)
         self.assertEqual(self.counter.read_text(), "1")
 
@@ -534,6 +776,213 @@ class ConsultProductTests(unittest.TestCase):
         }
         out = self.parsed(self.invoke(deterministic))
         self.assertEqual((out["status"], out["superior_sessions"]), ("ESCALATION_NOT_JUSTIFIED", 0))
+
+    def test_v2_focused_mode_contracts_do_not_require_wrapper_metadata(self):
+        for mode in ("merge-gate", "blocker-analysis", "replan"):
+            payload = v2_response(mode, ())
+            self.assertEqual(self.mod.validate_response(payload, "m", mode, "model", "low", [], "x" * 64),
+                             [])
+
+    def test_malformed_response_is_no_verdict_and_exposes_execution_id(self):
+        out = self.parsed(self.invoke(complete_bundle(), malformed=True))
+        self.assertEqual(out["status"], "NO_VERDICT_PROTOCOL_FAILURE")
+        self.assertEqual(out["detailed_status"], "MALFORMED_SUPERIOR_RESPONSE")
+        self.assertIsNone(out["verdict"])
+        self.assertTrue(out["execution_id"])
+
+    def test_one_explicit_replacement_is_fresh_and_linked(self):
+        first = self.parsed(self.invoke(complete_bundle(), malformed=True))
+        second = self.parsed(self.invoke(complete_bundle(), payload=response(),
+                                         extra=["--replacement-for", first["execution_id"]]))
+        self.assertEqual(second["status"], "COMPLETED")
+        self.assertEqual(second["replacement_for"], first["execution_id"])
+        entries = [json.loads(line) for line in self.ledger.read_text().splitlines()]
+        self.assertEqual(entries[-1]["replacement_for"], first["execution_id"])
+        self.assertEqual(self.counter.read_text(), "2")
+
+    def test_second_replacement_and_replacement_after_valid_verdict_are_rejected(self):
+        first = self.parsed(self.invoke(complete_bundle(), malformed=True))
+        second = self.parsed(self.invoke(complete_bundle(), payload=response(),
+                                         extra=["--replacement-for", first["execution_id"]]))
+        rejected = self.parsed(self.invoke(complete_bundle(), payload=response(),
+                                           extra=["--replacement-for", first["execution_id"]]))
+        self.assertEqual(rejected["status"], "REPLACEMENT_NOT_AUTHORIZED")
+        valid = self.parsed(self.invoke(complete_bundle("valid")))
+        unwanted = self.parsed(self.invoke(complete_bundle("valid"), payload=response()))
+        self.assertIn(unwanted["status"], {"CACHE_HIT", "COMPLETED"})
+        self.assertEqual(second["status"], "COMPLETED")
+        self.assertEqual(valid["status"], "COMPLETED")
+
+    def test_secret_scope_descriptions_pass_but_ambiguous_credentials_fail_closed(self):
+        bundle = complete_bundle()
+        bundle["observed_facts"] = [{"secret_scope": "contract metadata; values are redacted",
+                                     "authentication_contract": "caller supplies no credentials"}]
+        self.assertEqual(self.mod.secret_locations(bundle), [])
+        bundle["observed_facts"].append({"client_secret": "unknown-value"})
+        self.assertTrue(self.mod.secret_locations(bundle))
+
+    def test_status_separates_process_and_verdict_counters(self):
+        self.invoke(complete_bundle())
+        out = self.parsed(subprocess.run(
+            [sys.executable, str(SCRIPT), "--status", "--mission-id", "mission-1",
+             "--ledger", str(self.ledger), "--cache-dir", str(self.cache)],
+            text=True, capture_output=True, timeout=10))
+        self.assertEqual(out["process_attempts"], 1)
+        self.assertEqual(out["valid_verdicts"], 1)
+        self.assertEqual(out["protocol_failures"], 0)
+        self.assertEqual(out["replacement_attempts"], 0)
+
+    def test_replacement_with_changed_snapshot_is_rejected_before_transport(self):
+        first = self.parsed(self.invoke(complete_bundle(), malformed=True))
+        changed = complete_bundle()
+        changed["snapshot"]["checkpoint_fingerprint"] = "f" * 64
+        out = self.parsed(self.invoke(changed, payload=response(),
+                                      extra=["--replacement-for", first["execution_id"]]))
+        self.assertEqual(out["status"], "REPLACEMENT_NOT_AUTHORIZED")
+        self.assertEqual(self.counter.read_text(), "1")
+
+    def test_v2_merge_gate_cli_uses_focused_response_without_metadata(self):
+        bundle = complete_bundle("v2", "merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v2"}
+        payload = v2_response("merge-gate")
+        out = self.parsed(self.invoke(bundle, payload=payload))
+        self.assertEqual(out["status"], "COMPLETED")
+        self.assertEqual(out["response"], payload)
+
+    def test_completed_verdict_retains_lossless_canonical_evidence(self):
+        bundle = complete_bundle("durable", "merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v2"}
+        payload = v2_response("merge-gate")
+        out = self.parsed(self.invoke(bundle, payload=payload))
+        self.assertEqual((out["status"], out["detailed_status"]), ("COMPLETED", "VALID_ADVISORY_VERDICT"))
+        entry = json.loads(self.ledger.read_text().splitlines()[-1])
+        self.assertTrue(entry["response_artifact"])
+        self.assertEqual(entry["response_fingerprint"], self.mod.sha256(payload))
+        recovered = self.mod.read_persisted_response(self.cache, entry)
+        self.assertEqual(recovered["response"], payload)
+        self.assertEqual(recovered["question_answer_ids"], ["Q1"])
+        self.assertEqual(stat.S_IMODE((self.cache / entry["response_artifact"]["relative_path"]).stat().st_mode), 0o600)
+
+    def test_missing_or_corrupt_evidence_makes_a_valid_verdict_unusable(self):
+        bundle = complete_bundle("evidence-state", "merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v2"}
+        self.assertEqual(self.invoke(bundle, payload=v2_response("merge-gate")).returncode, 0)
+        entry = json.loads(self.ledger.read_text().splitlines()[-1])
+        artifact = self.cache / entry["response_artifact"]["relative_path"]
+        artifact.write_text('{"corrupt":true}')
+        with self.assertRaisesRegex(self.mod.ConsultError, "VERDICT_EVIDENCE_UNUSABLE"):
+            self.mod.read_persisted_response(self.cache, entry)
+        status = self.parsed(subprocess.run(
+            [sys.executable, str(SCRIPT), "--status", "--mission-id", "evidence-state",
+             "--ledger", str(self.ledger), "--cache-dir", str(self.cache)],
+            text=True, capture_output=True, timeout=10))
+        self.assertEqual(status["usable_valid_verdicts"], 0)
+        self.assertEqual(status["unusable_valid_verdicts"], 1)
+
+    def test_historical_valid_verdict_without_payload_is_explicitly_unusable_and_not_replaceable(self):
+        entry = {
+            "execution_id": "historical-valid", "mission_id": "historical", "verdict": "changes_required",
+            "status": "COMPLETED", "detailed_status": "VALID_ADVISORY_VERDICT", "cache": "MISS",
+            "mode": "merge-gate", "model": "gpt-5.6-sol", "reasoning_effort": "medium",
+            "snapshot": "s", "normalized_bundle_fingerprint": "b", "process_attempts": 1,
+        }
+        self.ledger.write_text(json.dumps(entry) + "\n")
+        status = self.parsed(subprocess.run(
+            [sys.executable, str(SCRIPT), "--status", "--mission-id", "historical",
+             "--ledger", str(self.ledger), "--cache-dir", str(self.cache)],
+            text=True, capture_output=True, timeout=10))
+        self.assertEqual(status["last_operational_status"], "HISTORICAL_VALID_VERDICT_UNUSABLE")
+        self.assertEqual(status["last_operational_reason"], "response payload not retained by the historical execution")
+        self.assertEqual(status["usable_valid_verdicts"], 0)
+        bundle = complete_bundle("historical", "merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v2"}
+        out = self.parsed(self.invoke(bundle, payload=v2_response("merge-gate"),
+                                      extra=["--replacement-for", "historical-valid", "--effort", "medium"]))
+        self.assertEqual(out["status"], "REPLACEMENT_NOT_AUTHORIZED")
+        self.assertEqual(self.counter.read_text(), "0")
+
+    def test_persistence_write_failure_is_not_a_usable_verdict_or_a_retry(self):
+        bundle = complete_bundle("persist-failure", "merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v2"}
+        self.cache.mkdir()
+        (self.cache / "responses").write_text("not a directory")
+        out = self.parsed(self.invoke(bundle, payload=v2_response("merge-gate")))
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_USABLE_VERDICT", "VERDICT_PERSISTENCE_FAILURE"))
+        self.assertIsNone(out["verdict"])
+        self.assertTrue(out["model_response_validated"])
+        self.assertEqual(out["validated_model_verdict"], "accept")
+        self.assertEqual(self.counter.read_text(), "1")
+
+    def test_commit_never_appends_a_usable_ledger_entry_before_evidence(self):
+        payload = v2_response("merge-gate")
+        identity = {"snapshot": "s", "bundle": "b", "mode": "merge-gate", "model": "gpt-5.6-sol", "effort": "low"}
+        args = self.mod.parse_args(["--mode", "merge-gate", "--mission-id", "atomic", "--bundle", "x"])
+        entry = self.mod.make_entry(args, "e-1", identity, "COMPLETED", "VALID_ADVISORY_VERDICT",
+                                    processes=1, turns=1, tools=0, verdict="accept", replacement_for=None)
+        with mock.patch.object(self.mod, "secure_write", side_effect=OSError("write failed")), \
+             mock.patch.object(self.mod, "append_ledger") as append:
+            with self.assertRaises(OSError):
+                self.mod.commit_usable_verdict(self.ledger, self.cache, entry, payload, identity, ["Q1"])
+        append.assert_not_called()
+
+    def test_ledger_append_failure_never_reports_a_committed_usable_verdict(self):
+        payload = v2_response("merge-gate")
+        identity = {"snapshot": "s", "bundle": "b", "mode": "merge-gate", "model": "gpt-5.6-sol", "effort": "low"}
+        args = self.mod.parse_args(["--mode", "merge-gate", "--mission-id", "atomic", "--bundle", "x"])
+        entry = self.mod.make_entry(args, "e-2", identity, "COMPLETED", "VALID_ADVISORY_VERDICT",
+                                    processes=1, turns=1, tools=0, verdict="accept", replacement_for=None)
+        with mock.patch.object(self.mod, "append_ledger", side_effect=OSError("append failed")):
+            with self.assertRaises(OSError):
+                self.mod.commit_usable_verdict(self.ledger, self.cache, entry, payload, identity, ["Q1"])
+        self.assertFalse(self.ledger.exists())
+        self.assertTrue(list((self.cache / "responses").glob("*.json")))
+
+    def test_atomic_artifact_never_exposes_partial_json_to_concurrent_reader(self):
+        artifact = self.cache / "responses" / ("a" * 64 + ".json")
+        data = json.dumps({"payload": "x" * 500_000})
+        observed = []
+        stop = threading.Event()
+
+        def reader():
+            while not stop.is_set():
+                if artifact.exists():
+                    try:
+                        json.loads(artifact.read_text())
+                        observed.append("valid")
+                    except json.JSONDecodeError:
+                        observed.append("partial")
+                time.sleep(0.001)
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        self.mod.secure_write(artifact, data)
+        time.sleep(0.02)
+        stop.set(); thread.join(timeout=2)
+        self.assertTrue(observed)
+        self.assertNotIn("partial", observed)
+
+    def test_interruption_before_atomic_rename_leaves_no_complete_artifact_or_temp_file(self):
+        artifact = self.cache / "responses" / ("b" * 64 + ".json")
+        with mock.patch.object(self.mod.os, "replace", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.mod.secure_write(artifact, '{"response":"complete"}')
+        self.assertFalse(artifact.exists())
+        self.assertEqual(list(artifact.parent.glob(f".{artifact.name}.*")), [])
+
+    def test_duplicate_execution_id_is_rejected_and_sensitive_response_is_not_persisted(self):
+        entry = {"execution_id": "duplicate", "mission_id": "dup"}
+        self.mod.append_ledger(self.ledger, entry)
+        with self.assertRaisesRegex(self.mod.ConsultError, "DUPLICATE_EXECUTION_REPLAY"):
+            self.mod.append_ledger(self.ledger, entry)
+        payload = v2_response("merge-gate")
+        payload["summary"] = "token=sk-abcdefghijklmnopqrstuvwxyz123456"
+        identity = {"snapshot": "s", "bundle": "b", "mode": "merge-gate", "model": "gpt-5.6-sol", "effort": "low"}
+        with self.assertRaisesRegex(self.mod.ConsultError, "VERDICT_PERSISTENCE_FAILURE"):
+            self.mod.persist_response_evidence(self.cache, payload, identity, ["Q1"])
+        self.assertFalse((self.cache / "responses").exists())
+        payload["summary"] = "see /home/ubuntu/private-review-note"
+        with self.assertRaisesRegex(self.mod.ConsultError, "VERDICT_PERSISTENCE_FAILURE"):
+            self.mod.persist_response_evidence(self.cache, payload, identity, ["Q1"])
 
 
 if __name__ == "__main__":

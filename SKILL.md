@@ -1,76 +1,34 @@
 ---
 name: codex-senior-consult
-description: Use when a long-running Codex mission faces a material architecture, security, isolation, concurrency, recovery, public-contract, replanning, final-review, or merge decision that local evidence alone cannot settle confidently.
+description: Use when a long-running agent or orchestration mission faces a material architecture, security, isolation, concurrency, recovery, public-contract, replanning, final-review, or merge decision that local evidence alone cannot settle confidently and the caller can provide a complete sanitized bundle.
 ---
 
 # Codex Senior Consult
 
-## Overview
+This is a caller-neutral, bounded senior-consultation primitive. The calling agent or mission owner supplies a complete frozen bundle; the senior consultant returns advisory evidence; the mission owner validates findings and performs all implementation and operational work. For example, Luna may be the mission owner and `gpt-5.6-sol` the default target model.
 
-Keep Luna as mission owner. Consult Sol only with a complete, sanitized snapshot; treat its one structured answer as advisory evidence, validate it locally, and continue the existing mission.
+The core execution contract is strict: one `codex exec` process per ordinary consultation execution, one stdin payload, one observed inference turn, zero tools, zero workspace reads, zero follow-ups, zero resume operations, zero repair executions, zero automatic content retries, an ephemeral session, a sanitized bounded bundle, and strict local validation. The CLI does not expose backend HTTP request counts, so this skill never claims exactly one backend request.
 
-**Core contract:** one `codex exec` process, one stdin payload, one observed inference turn, zero tools, zero follow-ups, zero `resume`, zero repair executions, and zero automatic retries by default. Never claim one backend HTTP request: the CLI does not expose that metric.
+The consultation execution ending does not end the surrounding mission. A malformed response, tool violation, timeout, or transport failure has no valid verdict. Its detailed status remains visible (`MALFORMED_SUPERIOR_RESPONSE`, `SINGLE_PASS_CONTRACT_VIOLATION`, `TIMEOUT`, or `TRANSPORT_ERROR`) and is wrapped as `NO_VERDICT_PROTOCOL_FAILURE`. A schema- and locally-valid response is actionable only after its canonical response artifact has been atomically persisted and verified. If that commit fails, the result is `NO_USABLE_VERDICT / VERDICT_PERSISTENCE_FAILURE`, never an actionable verdict; no automatic retry or replacement follows.
+
+After a no-verdict protocol failure, the caller may initiate at most one fresh replacement with `--replacement-for <execution-id>`. It must use the same mission, mode, target model, effort, frozen snapshot, and normalized bundle. A replacement is never allowed after a schema-valid model verdict (including a historically valid but evidence-unavailable one), never replaces a replacement, and never exists merely because the caller dislikes a verdict or its confidence. Cache hits are not replacements.
 
 ## Workflow
 
-1. Investigate locally: inspect, reproduce, read documentation, run tests, maintain the plan/checkpoint, and resolve deterministic questions without Sol.
-2. Apply the escalation gate. Escalate only if the answer can materially change architecture, a hard gate, security/isolation/concurrency/recovery, a public contract, merge, or an irreversible action. Otherwise stop with `ESCALATION_NOT_JUSTIFIED`.
-3. Group every unresolved question from the same snapshot. Deduplicate and order by impact.
-4. Build the v1 bundle. **REQUIRED:** read [references/contracts.md](references/contracts.md) before authoring or reviewing a bundle.
-5. Run the bundle-completeness and secret gates locally. Never ask Sol what context it needs.
-6. Invoke `scripts/codex_senior_consult.py` once. Use `integrated-review` and `low` unless a documented observable trigger selects `medium`.
-7. Validate the response against local evidence. Sol advises; Luna decides and executes.
+1. Investigate locally and resolve deterministic questions without consultation.
+2. Apply the escalation gate; group unresolved questions in one bundle.
+3. Read [references/contracts.md](references/contracts.md), build the v1 input bundle, and pass local completeness, path, and secret gates.
+4. Invoke the script once with `--mode`, `--mission-id`, and `--bundle`; use `gpt-5.6-sol` and `low` unless a documented trigger selects `medium`.
+5. Validate the advisory result locally. The mission owner decides and executes.
+6. If and only if the execution has a no-verdict protocol failure, a caller may make one explicit fresh replacement using its returned execution ID.
 
 ```bash
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/codex-senior-consult/scripts/codex_senior_consult.py" \
-  --mode integrated-review \
-  --mission-id native-recovery \
-  --bundle consultation.json
+  --mode merge-gate --mission-id example-mission --bundle consultation.json
 ```
 
-Use `--help` for overrides and `--status --mission-id ID` for budget/ledger totals. Read [references/examples.md](references/examples.md) for plan, integrated-review, replan, merge-gate, and current CLI limitations.
+Normal semantic policy is two valid senior verdicts; three is the maximum for a material replan. Process attempts, valid verdicts, protocol failures, replacement attempts, cache hits, transport retries, and observed model turns are counted separately. `--status` exposes both semantic usage and actual process cost. The total process budget is hard-bounded; replacement allowance is one by default.
 
-## Quick Reference
+The response contract is version `codex-senior-consult-response/v2`. It is mode-specific, minimal, strict (`additionalProperties: false`), and does not require the target model to copy wrapper metadata. v1 responses remain available only through the explicit transition represented by a v1 bundle request or `--legacy-response-v1`; see the migration notes in [references/contracts.md](references/contracts.md).
 
-| Need | Mode / action |
-|---|---|
-| Plan + risks + questions + decision | `integrated-review` (recommended) |
-| Review an existing plan minimally | `plan-review` |
-| New evidence invalidated the plan | `replan` delta |
-| Well-investigated blocker | `blocker-analysis` |
-| Cross-domain risk review | `risk-audit` |
-| Evidence/claim classification | `final-review` |
-| Strict merge decision | `merge-gate` |
-| Deterministic/local answer | Do not consult; zero sessions |
-
-Normal mission budget: two Sol sessions; hard limit: three. Reserve session three for a material replan. Cache hits consume zero sessions.
-
-## How to run a multi-hour Luna mission with only two single-pass Sol sessions
-
-Luna investigates and plans → Sol `integrated-review` low → Luna executes many phases and validates findings locally → Sol `merge-gate` low. Normal consumption: two sessions, one observed turn each, no tools or follow-ups. If new evidence materially invalidates the plan, use the third and final normal session for `replan`. A deterministic mission uses zero.
-
-## Non-Negotiable Failures
-
-- Incomplete bundle: `BUNDLE_INCOMPLETE`; do not execute Codex.
-- Tool event or extra turn: `SINGLE_PASS_CONTRACT_VIOLATION`; never relaunch.
-- Malformed answer: `MALFORMED_SUPERIOR_RESPONSE`; only local syntactic extraction, never a repair call.
-- Low confidence, disagreement, blockers, or conservative wording: accept the valid advisory result; never follow up.
-- Recursion marker present: `RECURSIVE_ESCALATION_BLOCKED` before Codex.
-- Transport failure: zero retries unless `--transport-retries 1` was explicitly supplied.
-
-## Common Rationalizations
-
-| Rationalization | Required response |
-|---|---|
-| “Persistent Sol remembers better.” | Bundle the snapshot; never `resume`. |
-| “Repair malformed JSON in one more turn.” | End invalid; repair only syntax locally. |
-| “Low confidence needs clarification.” | Record uncertainty; Luna investigates locally. |
-| “Frequent checkpoints reassure us.” | Report progress locally; keep the two-session cadence. |
-| “Read-only tools are harmless.” | Any tool call violates the contract. |
-| “Quota is available.” | Quota never justifies escalation or higher effort. |
-
-## Red Flags — Stop
-
-Separate calls per concern; `resume`; workspace exposure by default; repair prompts; confidence follow-ups; automatic content retry; Sol executing the mission; copied auth stores; full logs/history/repository; secret-bearing bundles. Any of these violates the normal architecture.
-
-On `codex-cli 0.146.0`, `--workspace-read` and `--dangerous-yolo` fail closed before execution because the CLI cannot preserve the zero-tool security boundary in those modes.
+Do not grant workspace access or tools for convenience, do not use `resume`, and do not turn low confidence or an inconvenient valid verdict into a retry. See [tests/pressure-baseline.md](tests/pressure-baseline.md) for pressure cases.

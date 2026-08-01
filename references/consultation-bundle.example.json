@@ -1,60 +1,24 @@
 {
   "schema_version": "codex-senior-consult/v1",
-  "mission_id": "native-recovery",
-  "mode": "integrated-review",
-  "objective": "Restore native recovery without duplicate side effects.",
-  "decision_needed": "Decide whether the bounded recovery plan is safe to execute.",
-  "current_plan": {
-    "version": "plan-3",
-    "phases": ["reproduce", "isolate", "implement", "verify", "merge-gate"]
-  },
-  "progress": {
-    "completed": ["reproduce", "isolate"],
-    "current": "implementation-ready"
-  },
-  "relevant_contracts": ["Recovery must be idempotent and fail closed."],
-  "observed_facts": ["The isolated reproduction emits one completion event."],
-  "invalidated_assumptions": ["A retry is not side-effect free."],
-  "candidate_decision": {"choice": "Add an idempotency key before retry."},
-  "alternatives": [
-    {"choice": "Disable retry", "tradeoff": "Availability decreases."},
-    {"choice": "Reconcile after retry", "tradeoff": "Duplicate side effects remain possible."}
-  ],
-  "code_excerpts": [
-    {"path": "src/recovery.py", "lines": "40-58", "content": "def recover(event): ..."}
-  ],
-  "diff": {"summary": "No implementation diff yet.", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
-  "tests": [
-    {"command": "pytest -q tests/test_recovery.py", "exit_code": 0, "summary": "8 passed"}
-  ],
-  "runtime_evidence": [
-    {"source": "isolated-smoke", "result": "one completion event; retry not exercised"}
-  ],
-  "constraints": ["No production writes", "No duplicated completion", "Scope remains recovery only"],
-  "risks_already_identified": ["Crash between side effect and acknowledgment."],
-  "questions": [
-    "Which candidate assumption is unsupported?",
-    "Does the idempotency boundary cover the observed crash window?",
-    "Which security risk remains?",
-    "Which isolation risk remains?",
-    "What is the minimum safe plan delta?",
-    "What is the next safe local action?"
-  ],
-  "requested_output": {"schema_version": "codex-senior-consult-response/v1"},
-  "snapshot": {
-    "repository_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "working_tree_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-    "plan_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-    "checkpoint_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-  },
-  "escalation": {
-    "justified": true,
-    "reasons": ["duplicate_side_effects", "recovery"],
-    "local_deterministic_checks": [
-      "Reproduced the crash window in isolation.",
-      "Ran the focused recovery tests.",
-      "Checked the approved idempotency contract."
-    ],
-    "material_impact": "The decision changes recovery semantics and may duplicate side effects."
-  }
+  "mission_id": "example-mission",
+  "mode": "merge-gate",
+  "objective": "Decide whether the frozen change is safe to merge.",
+  "decision_needed": "Apply the strict merge gate to the supplied evidence.",
+  "current_plan": {"version": "p2", "phases": ["inspect", "implement", "verify"]},
+  "progress": {"completed": ["inspect", "implement"], "current": "verify"},
+  "relevant_contracts": ["The senior consultant is advisory and has no tools."],
+  "observed_facts": ["The focused and full offline suites passed."],
+  "invalidated_assumptions": [],
+  "candidate_decision": {"choice": "merge after local review"},
+  "alternatives": [{"choice": "defer", "tradeoff": "delayed delivery"}],
+  "code_excerpts": [{"path": "scripts/codex_senior_consult.py", "lines": "1-20", "content": "bounded wrapper contract"}],
+  "diff": {"summary": "Versioned schemas and bounded replacement", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "tests": [{"command": "python3 -m unittest discover -s tests", "exit_code": 0, "summary": "offline suite passed"}],
+  "runtime_evidence": [{"source": "local dogfood", "result": "pending"}],
+  "constraints": ["Single pass", "No tools", "No workspace reads", "Advisory only"],
+  "risks_already_identified": ["Protocol failures must not become verdicts."],
+  "questions": [{"id": "merge-evidence", "text": "Does the evidence support the merge gate?"}],
+  "requested_output": {"schema_version": "codex-senior-consult-response/v2"},
+  "snapshot": {"repository_head": "0123456789abcdef0123456789abcdef01234567", "working_tree_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "plan_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "checkpoint_fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+  "escalation": {"justified": true, "reasons": ["public_contract", "security"], "local_deterministic_checks": ["Read contracts", "Ran offline tests"], "material_impact": "The result controls a public merge gate."}
 }
