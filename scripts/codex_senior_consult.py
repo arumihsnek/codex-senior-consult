@@ -18,9 +18,10 @@ import tempfile
 import uuid
 from typing import Any
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 BUNDLE_SCHEMA = "codex-senior-consult/v1"
 RESPONSE_SCHEMA = "codex-senior-consult-response/v2"
+V3_RESPONSE_SCHEMA = "codex-senior-consult-response/v3"
 LEGACY_RESPONSE_SCHEMA = "codex-senior-consult-response/v1"
 RESPONSE_ARTIFACT_SCHEMA = "codex-senior-consult-response-artifact/v1"
 MODES = {"integrated-review", "plan", "plan-review", "replan", "blocker-analysis", "risk-audit", "final-review", "merge-gate"}
@@ -39,6 +40,18 @@ SECRET_PATTERNS = [
 SENSITIVE_KEY = re.compile(r"(?i)(?:password|passwd|secret|api.?key|access.?token|refresh.?token|private.?key|credential|authorization|bearer|auth)")
 DESCRIPTIVE_KEY = re.compile(r"(?i)(?:scope|contract|policy|description|behavior|redaction|metadata|requirement|finding|risk)")
 BASE_REQUIRED = {"schema_version", "mission_id", "mode", "objective", "decision_needed", "current_plan", "progress", "relevant_contracts", "observed_facts", "invalidated_assumptions", "candidate_decision", "alternatives", "code_excerpts", "diff", "tests", "runtime_evidence", "constraints", "risks_already_identified", "questions", "requested_output", "snapshot", "escalation"}
+DETERMINISTIC_FIELDS = {"schema_version", "mission_id", "mode", "requested_output", "repository"}
+CALLER_FIELDS = tuple(sorted(BASE_REQUIRED - DETERMINISTIC_FIELDS - {"snapshot"}))
+CALLER_POINTERS = {f"/{name}" for name in CALLER_FIELDS} | {"/snapshot/plan_fingerprint", "/snapshot/checkpoint_fingerprint"}
+EXPECTED_TYPES: dict[str, tuple[type, ...]] = {
+    "/objective": (str,), "/decision_needed": (str,), "/current_plan": (dict,),
+    "/progress": (dict,), "/candidate_decision": (dict,), "/alternatives": (list,),
+    "/constraints": (list,), "/questions": (list,), "/escalation": (dict,),
+    "/relevant_contracts": (list,), "/observed_facts": (list,),
+    "/invalidated_assumptions": (list,), "/code_excerpts": (list,), "/diff": (dict,),
+    "/tests": (list,), "/runtime_evidence": (list,), "/risks_already_identified": (list,),
+    "/snapshot/plan_fingerprint": (str,), "/snapshot/checkpoint_fingerprint": (str,),
+}
 
 class ConsultError(Exception):
     def __init__(self, code: str, details: list[str] | None = None):
@@ -50,6 +63,119 @@ def sha256(value: Any) -> str: return hashlib.sha256(canonical(value)).hexdigest
 def safe_mission_id(value: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value or ""): raise ConsultError("INVALID_MISSION_ID", ["mission_id must be path-safe and 1-128 characters"])
     return value
+
+def translate_legacy_argv(argv: list[str]) -> list[str]:
+    if argv and argv[0] in {"build-bundle", "preflight", "consult", "status"}: return list(argv)
+    return ["consult", *argv]
+
+def _git(repository: Path, *args: str) -> bytes:
+    proc = subprocess.run(["git", "-C", str(repository), *args], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, check=False)
+    if proc.returncode: raise ConsultError("INVALID_REPOSITORY", ["repository must be a readable Git worktree"])
+    return proc.stdout
+
+def build_bundle_skeleton(mission_id: str, mode: str, repository: Path) -> dict[str, Any]:
+    safe_mission_id(mission_id)
+    if mode not in MODES: raise ConsultError("BUNDLE_INCOMPLETE", ["unsupported mode"])
+    repository = repository.resolve()
+    head = _git(repository, "rev-parse", "HEAD").decode().strip()
+    status = _git(repository, "status", "--porcelain=v1", "-z")
+    diff = _git(repository, "diff", "--binary", "HEAD")
+    tree_fingerprint = hashlib.sha256(status + b"\0" + diff).hexdigest()
+    bundle: dict[str, Any] = {key: None for key in BASE_REQUIRED}
+    bundle.update({
+        "schema_version": BUNDLE_SCHEMA, "mission_id": mission_id, "mode": mode,
+        "requested_output": {"schema_version": V3_RESPONSE_SCHEMA},
+        "repository": {"name": repository.name, "dirty": bool(status),
+                       "identity_fingerprint": hashlib.sha256(str(repository).encode()).hexdigest()},
+        "snapshot": {"repository_head": head, "working_tree_fingerprint": tree_fingerprint,
+                     "plan_fingerprint": None, "checkpoint_fingerprint": None},
+        "caller_required": sorted(CALLER_POINTERS),
+    })
+    return bundle
+
+def _pointer_parts(pointer: str) -> list[str]:
+    if not isinstance(pointer, str) or not pointer.startswith("/") or pointer == "/":
+        raise ValueError("invalid RFC 6901 pointer")
+    parts = []
+    for raw in pointer[1:].split("/"):
+        if re.search(r"~(?![01])", raw): raise ValueError("invalid RFC 6901 escape")
+        parts.append(raw.replace("~1", "/").replace("~0", "~"))
+    return parts
+
+def resolve_json_pointer(value: Any, pointer: str) -> Any:
+    current = value
+    for part in _pointer_parts(pointer):
+        if not isinstance(current, dict) or part not in current: raise KeyError(pointer)
+        current = current[part]
+    return current
+
+def assign_json_pointer(value: dict[str, Any], pointer: str, child: Any) -> None:
+    current: Any = value; parts = _pointer_parts(pointer)
+    for part in parts[:-1]:
+        if not isinstance(current, dict) or part not in current: raise KeyError(pointer)
+        current = current[part]
+    if not isinstance(current, dict) or parts[-1] not in current: raise KeyError(pointer)
+    current[parts[-1]] = child
+
+def _sentinel(value: Any) -> bool:
+    return isinstance(value, str) and bool(re.fullmatch(r"\s*[<\[]?(?:caller[_ -]?required|todo|tbd|placeholder)[>\]]?\s*", value, re.I))
+
+def _diagnostic(code: str, path: str, state: str, reason: str, expected: str, guidance: str) -> dict[str, Any]:
+    return {"code": code, "path": path, "state": state, "reason": reason,
+            "expected": {"type": expected},
+            "remediation": {"guidance": guidance, "suggested_source": "mission-owned sanitized evidence"},
+            "category": "bundle", "model_process_consumed": False}
+
+def normalize_construction_bundle(source: dict[str, Any]) -> dict[str, Any]:
+    bundle = json.loads(json.dumps(source)); diagnostics: list[dict[str, Any]] = []
+    pointers = bundle.get("caller_required", [])
+    if not isinstance(pointers, list):
+        diagnostics.append(_diagnostic("CALLER_REQUIRED_INVALID", "/caller_required", "invalid", "caller_required must be an array", "array", "Use unique RFC 6901 pointers.")); pointers = []
+    seen: set[str] = set(); remaining: list[str] = []
+    for pointer in pointers:
+        if pointer in seen:
+            diagnostics.append(_diagnostic("CALLER_REQUIRED_DUPLICATE_PATH", str(pointer), "invalid", "duplicate caller-required path", "unique RFC 6901 pointer", "Remove the duplicate path.")); continue
+        seen.add(pointer)
+        try: value = resolve_json_pointer(bundle, pointer)
+        except (KeyError, ValueError, TypeError):
+            diagnostics.append(_diagnostic("CALLER_REQUIRED_UNKNOWN_PATH", str(pointer), "missing", "path is outside the supported construction schema", "supported RFC 6901 pointer", "Use a path emitted by build-bundle.")); continue
+        if pointer not in CALLER_POINTERS:
+            diagnostics.append(_diagnostic("CALLER_REQUIRED_NON_NULL", pointer, "invalid", "deterministic fields must not be caller-fillable", "path absent from caller_required", "Remove this deterministic field path.")); continue
+        expected = EXPECTED_TYPES[pointer]
+        if value is None:
+            diagnostics.append(_diagnostic("CALLER_VALUE_NULL", pointer, "null", "caller-owned evidence is still null", expected[0].__name__, "Supply bounded sanitized mission evidence.")); remaining.append(pointer); continue
+        invalid = not isinstance(value, expected) or _sentinel(value)
+        if isinstance(value, (str, list, dict)) and not value and pointer not in {"/invalidated_assumptions", "/risks_already_identified", "/code_excerpts", "/runtime_evidence", "/relevant_contracts", "/observed_facts"}: invalid = True
+        if pointer.startswith("/snapshot/") and (not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)): invalid = True
+        if invalid:
+            diagnostics.append(_diagnostic("CALLER_VALUE_INVALID", pointer, "invalid", "value fails its local type or value constraints", expected[0].__name__, "Replace it with a valid bounded value.")); remaining.append(pointer)
+    bundle["caller_required"] = remaining
+    return {"bundle": bundle, "caller_required": remaining, "diagnostics": diagnostics}
+
+def preflight_bundle(source: dict[str, Any], *, mission_id: str, mode: str) -> dict[str, Any]:
+    normalized = normalize_construction_bundle(source); diagnostics = normalized["diagnostics"]
+    if normalized["caller_required"]:
+        return {"status": "PREFLIGHT_INVALID", "valid": False, "diagnostics": diagnostics,
+                "model_processes_consumed": 0, "checks": {"bundle": False, "local_state": True,
+                "ledger_cache": True, "replacement": True, "lock": True}}
+    payload = normalized["bundle"]; payload.pop("caller_required", None)
+    try: prepared = validate_and_prepare_bundle(payload, mission_id, mode)
+    except ConsultError as exc:
+        for detail in exc.details:
+            diagnostics.append(_diagnostic(exc.code, "/", "invalid", detail, "valid bundle", "Correct the reported field."))
+        return {"status": "PREFLIGHT_INVALID", "valid": False, "diagnostics": diagnostics,
+                "model_processes_consumed": 0, "checks": {"bundle": False, "local_state": True,
+                "ledger_cache": True, "replacement": True, "lock": True}}
+    snapshot_fingerprint = sha256(prepared["snapshot"])
+    return {"status": "PREFLIGHT_VALID", "valid": True, "diagnostics": [], "payload": prepared,
+            "model_processes_consumed": 0, "normalized": {"mode": mode, "mission_id": mission_id,
+            "repository_head": prepared["snapshot"]["repository_head"],
+            "dirty": bool(source.get("repository", {}).get("dirty")),
+            "bundle_fingerprint": prepared["normalized_bundle_fingerprint"],
+            "snapshot_fingerprint": snapshot_fingerprint, "caller_required_remaining": 0},
+            "checks": {"bundle": True, "local_state": True, "ledger_cache": True,
+                       "replacement": True, "lock": True}}
 
 def secure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True, mode=0o700); info = path.lstat()
@@ -145,7 +271,7 @@ def validate_and_prepare_bundle(bundle: Any, mission_id: str, mode: str) -> dict
     questions = bundle.get("questions")
     if not isinstance(questions, list) or not any(isinstance(q, (str, dict)) and q for q in questions): missing.append("questions must contain concrete questions")
     requested = bundle.get("requested_output")
-    if not isinstance(requested, dict) or requested.get("schema_version") not in {RESPONSE_SCHEMA, LEGACY_RESPONSE_SCHEMA}: missing.append("requested_output.schema_version must be v2 or explicit legacy v1")
+    if not isinstance(requested, dict) or requested.get("schema_version") not in {V3_RESPONSE_SCHEMA, RESPONSE_SCHEMA, LEGACY_RESPONSE_SCHEMA}: missing.append(f"requested_output.schema_version must be {V3_RESPONSE_SCHEMA} (v1/v2 are historical compatibility only)")
     snapshot = bundle.get("snapshot"); snapshot_keys = {"repository_head", "working_tree_fingerprint", "plan_fingerprint", "checkpoint_fingerprint"}
     if not isinstance(snapshot, dict) or not snapshot_keys.issubset(snapshot): missing.append("snapshot must identify HEAD and all fingerprints")
     elif (not re.fullmatch(r"[0-9a-f]{40,64}", str(snapshot["repository_head"])) or any(not re.fullmatch(r"[0-9a-f]{64}", str(snapshot[k])) for k in snapshot_keys - {"repository_head"})): missing.append("snapshot fingerprints are invalid")
@@ -503,6 +629,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     state = Path.home() / ".local" / "state" / "codex-senior-consult"; p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=sorted(MODES)); p.add_argument("--mission-id", required=True); p.add_argument("--bundle"); p.add_argument("--model", default="gpt-5.6-sol"); p.add_argument("--effort", choices=sorted(EFFORTS), default="low"); p.add_argument("--critical", action="append", choices=sorted(MEDIUM_TRIGGERS), default=[]); p.add_argument("--replacement-for"); p.add_argument("--legacy-response-v1", action="store_true"); p.add_argument("--status", action="store_true"); p.add_argument("--workspace-read"); p.add_argument("--workspace-read-justification"); p.add_argument("--no-cache", action="store_true"); p.add_argument("--refresh", action="store_true"); p.add_argument("--timeout", type=int, default=180); p.add_argument("--transport-retries", type=int, choices=(0, 1), default=0); p.add_argument("--dangerous-yolo", action="store_true"); p.add_argument("--ledger", default=str(state / "ledger.jsonl")); p.add_argument("--cache-dir", default=str(state / "cache")); p.add_argument("--max-bundle-bytes", type=int, default=131072); p.add_argument("--soft-budget", type=int, default=2); p.add_argument("--hard-budget", type=int, default=3); p.add_argument("--process-hard-budget", type=int); p.add_argument("--replacement-budget", type=int, default=1); return p.parse_args(argv)
 
+def construction_parser(command: str) -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog=f"codex_senior_consult.py {command}")
+    p.add_argument("--mission-id", required=True); p.add_argument("--mode", required=True, choices=sorted(MODES))
+    if command == "build-bundle":
+        p.add_argument("--repository", default="."); p.add_argument("--output"); p.add_argument("--overwrite", action="store_true")
+    else:
+        p.add_argument("--bundle", required=True); p.add_argument("--normalized-output"); p.add_argument("--overwrite", action="store_true")
+        p.add_argument("--max-bundle-bytes", type=int, default=131072)
+    return p
+
+def command_help() -> str:
+    return "commands: build-bundle, preflight, consult, status"
+
 def build_prompt(bundle: dict[str, Any], model: str, effort: str) -> str:
     mode = bundle["mode"]; return ("You are a bounded, single-pass senior consultant.\nUse only this supplied bundle. Do not use tools, inspect workspace, read files, execute commands, invoke MCP. Do not invoke subagents or other models. Do not ask follow-ups, resume, repair, or request another turn. Return exactly one final JSON object matching the mode contract. The wrapper owns identity metadata; do not reproduce it. Address every question by stable question id. A consultation execution may terminate fail-closed while the mission owner continues locally.\nMode: " + mode + "\nTarget model: " + model + "\nReasoning effort: " + effort + "\nBundle:\n" + json.dumps(bundle, sort_keys=True, ensure_ascii=False))
 
@@ -511,14 +650,44 @@ def make_entry(args: argparse.Namespace, execution_id: str, identity: dict[str, 
 
 def main(argv: list[str] | None = None) -> int:
     try:
-        args = parse_args(argv); safe_mission_id(args.mission_id)
+        raw_argv = list(sys.argv[1:] if argv is None else argv)
+        if not raw_argv or raw_argv == ["--help"]:
+            print(command_help()); return 0
+        translated = translate_legacy_argv(raw_argv); command = translated[0]
+        if command == "build-bundle":
+            build_args = construction_parser(command).parse_args(translated[1:])
+            bundle = build_bundle_skeleton(build_args.mission_id, build_args.mode, Path(build_args.repository))
+            if build_args.output:
+                target = Path(build_args.output)
+                if target.exists() and not build_args.overwrite: return emit({**base_metrics("OUTPUT_EXISTS", build_args.mission_id), "details": ["use --overwrite to replace output"]}, 2)
+                secure_write(target, json.dumps(bundle, sort_keys=True, indent=2) + "\n")
+                return emit({"status": "BUNDLE_BUILT", "mission_id": build_args.mission_id, "output": str(target), "model_processes_consumed": 0})
+            return emit({"status": "BUNDLE_BUILT", "mission_id": build_args.mission_id, "bundle": bundle, "model_processes_consumed": 0})
+        if command == "preflight":
+            pre_args = construction_parser(command).parse_args(translated[1:]); _, raw = read_regular_input(pre_args.bundle, pre_args.max_bundle_bytes)
+            try: source = json.loads(raw)
+            except json.JSONDecodeError as exc: return emit({"status": "PREFLIGHT_INVALID", "valid": False, "diagnostics": [_diagnostic("BUNDLE_JSON_INVALID", "/", "invalid", exc.msg, "JSON object", "Correct the JSON syntax.")], "model_processes_consumed": 0}, 2)
+            result = preflight_bundle(source, mission_id=pre_args.mission_id, mode=pre_args.mode)
+            if result.get("valid") and pre_args.normalized_output:
+                target = Path(pre_args.normalized_output)
+                if target.exists() and not pre_args.overwrite: return emit({**result, "status": "OUTPUT_EXISTS"}, 2)
+                secure_write(target, json.dumps(result["payload"], sort_keys=True, indent=2) + "\n")
+            return emit({k: v for k, v in result.items() if k != "payload"}, 0 if result.get("valid") else 2)
+        legacy_argv = translated[1:]
+        if command == "status" and "--status" not in legacy_argv: legacy_argv = [*legacy_argv, "--status"]
+        args = parse_args(legacy_argv); safe_mission_id(args.mission_id)
         if args.status: return emit(status_report(args))
         if os.environ.get("CODEX_SENIOR_CONSULT_ACTIVE") == "1": return emit(base_metrics("RECURSIVE_ESCALATION_BLOCKED", args.mission_id), 2)
         if not args.bundle or not args.mode: return emit(base_metrics("BUNDLE_INCOMPLETE", args.mission_id), 2)
         _, raw = read_regular_input(args.bundle, args.max_bundle_bytes)
         try: source = json.loads(raw)
         except json.JSONDecodeError as exc: return emit({**base_metrics("BUNDLE_INCOMPLETE", args.mission_id), "details": [f"invalid JSON: {exc.msg}"]}, 2)
-        bundle = validate_and_prepare_bundle(source, args.mission_id, args.mode); args.effort_triggers = sorted(set(args.critical)); args.effective_effort = "medium" if args.effort in {"low", "medium"} and args.effort_triggers else args.effort; args.allow_legacy = args.legacy_response_v1 or bundle["requested_output"].get("schema_version") == LEGACY_RESPONSE_SCHEMA
+        local_preflight = preflight_bundle(source, mission_id=args.mission_id, mode=args.mode)
+        if not local_preflight["valid"]:
+            codes = {d["code"] for d in local_preflight["diagnostics"]}
+            status = "SECRET_DETECTED" if "SECRET_DETECTED" in codes else "PRIVATE_PATH_DETECTED" if "PRIVATE_PATH_DETECTED" in codes else "BUNDLE_INCOMPLETE"
+            return emit({**base_metrics(status, args.mission_id), "diagnostics": local_preflight["diagnostics"], "details": [d["reason"] for d in local_preflight["diagnostics"]], "model_processes_consumed": 0}, 2)
+        bundle = local_preflight["payload"]; args.effort_triggers = sorted(set(args.critical)); args.effective_effort = "medium" if args.effort in {"low", "medium"} and args.effort_triggers else args.effort; args.allow_legacy = args.legacy_response_v1 or bundle["requested_output"].get("schema_version") == LEGACY_RESPONSE_SCHEMA
         if not bundle["escalation"].get("justified", True): return emit({**base_metrics("ESCALATION_NOT_JUSTIFIED", args.mission_id), "superior_sessions": 0, "codex_exec_processes": 0}, 0)
         if args.workspace_read: return emit({**base_metrics("WORKSPACE_READ_UNSUPPORTED", args.mission_id), "details": ["workspace access cannot preserve zero tools"]}, 3)
         if args.dangerous_yolo: return emit({**base_metrics("DANGEROUS_YOLO_DISABLED", args.mission_id), "details": ["dangerous bypass is disabled"]}, 3)

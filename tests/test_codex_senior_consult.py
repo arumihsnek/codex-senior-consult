@@ -989,5 +989,84 @@ class ConsultProductTests(unittest.TestCase):
             self.mod.persist_response_evidence(self.cache, payload, identity, ["Q1"])
 
 
+class V3ConstructionPreflightTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = load_module()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.temp.name)
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "Test"], check=True)
+        (self.repo / "README.md").write_text("fixture\n")
+        subprocess.run(["git", "-C", str(self.repo), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-qm", "fixture"], check=True)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_legacy_cli_translation_has_no_independent_consult_path(self):
+        legacy = ["--mode", "merge-gate", "--mission-id", "m", "--bundle", "b.json"]
+        self.assertEqual(self.mod.translate_legacy_argv(legacy), ["consult", *legacy])
+        self.assertEqual(self.mod.translate_legacy_argv(["preflight", *legacy]), ["preflight", *legacy])
+
+    def test_build_bundle_for_every_mode_uses_null_and_rfc6901_metadata(self):
+        for mode in self.mod.MODES:
+            bundle = self.mod.build_bundle_skeleton("mission-1", mode, self.repo)
+            self.assertEqual(bundle["mode"], mode)
+            self.assertEqual(bundle["requested_output"]["schema_version"], "codex-senior-consult-response/v3")
+            self.assertEqual(bundle["objective"], None)
+            self.assertIn("/objective", bundle["caller_required"])
+            self.assertTrue(all(pointer.startswith("/") for pointer in bundle["caller_required"]))
+            self.assertNotIn("<CALLER_REQUIRED>", json.dumps(bundle))
+            self.assertRegex(bundle["snapshot"]["repository_head"], r"^[0-9a-f]{40,64}$")
+
+    def test_normalization_removes_valid_filled_pointer_and_never_hashes_pending_bundle(self):
+        bundle = self.mod.build_bundle_skeleton("mission-1", "merge-gate", self.repo)
+        bundle["objective"] = "Decide whether the fixture is internally consistent."
+        result = self.mod.normalize_construction_bundle(bundle)
+        self.assertNotIn("/objective", result["caller_required"])
+        self.assertNotIn("normalized_bundle_fingerprint", result)
+        bundle["objective"] = []
+        invalid = self.mod.normalize_construction_bundle(bundle)
+        diagnostic = next(d for d in invalid["diagnostics"] if d["path"] == "/objective")
+        self.assertEqual((diagnostic["code"], diagnostic["state"]), ("CALLER_VALUE_INVALID", "invalid"))
+
+    def test_pointer_integrity_and_deterministic_field_boundary(self):
+        bundle = self.mod.build_bundle_skeleton("mission-1", "merge-gate", self.repo)
+        bundle["caller_required"] += ["/objective", "/unknown", "/mode"]
+        result = self.mod.normalize_construction_bundle(bundle)
+        codes = {(d["code"], d["path"]) for d in result["diagnostics"]}
+        self.assertIn(("CALLER_REQUIRED_DUPLICATE_PATH", "/objective"), codes)
+        self.assertIn(("CALLER_REQUIRED_UNKNOWN_PATH", "/unknown"), codes)
+        self.assertIn(("CALLER_REQUIRED_NON_NULL", "/mode"), codes)
+
+    def test_preflight_distinguishes_null_and_suppresses_cascades_without_process(self):
+        bundle = self.mod.build_bundle_skeleton("mission-1", "merge-gate", self.repo)
+        with mock.patch.object(self.mod, "run_process", side_effect=AssertionError("model process consumed")):
+            result = self.mod.preflight_bundle(bundle, mission_id="mission-1", mode="merge-gate")
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["model_processes_consumed"], 0)
+        diff_errors = [d for d in result["diagnostics"] if d["path"] == "/diff"]
+        self.assertEqual(len(diff_errors), 1)
+        self.assertEqual(diff_errors[0]["state"], "null")
+        self.assertIn("expected", diff_errors[0])
+        self.assertIn("remediation", diff_errors[0])
+
+    def test_completed_bundle_preflights_and_strips_construction_metadata(self):
+        bundle = self.mod.build_bundle_skeleton("mission-1", "merge-gate", self.repo)
+        values = complete_bundle(mode="merge-gate")
+        values["requested_output"] = {"schema_version": "codex-senior-consult-response/v3"}
+        for pointer in list(bundle["caller_required"]):
+            self.mod.assign_json_pointer(bundle, pointer, self.mod.resolve_json_pointer(values, pointer))
+        result = self.mod.preflight_bundle(bundle, mission_id="mission-1", mode="merge-gate")
+        self.assertTrue(result["valid"], result["diagnostics"])
+        self.assertEqual(result["model_processes_consumed"], 0)
+        self.assertNotIn("caller_required", result["payload"])
+        self.assertRegex(result["normalized"]["bundle_fingerprint"], r"^[0-9a-f]{64}$")
+
+
 if __name__ == "__main__":
     unittest.main()
