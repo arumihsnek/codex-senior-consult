@@ -164,10 +164,10 @@ STRING = {"type": "string", "minLength": 1}
 # list elements non-empty and enforce cross-item rules locally where required.
 STRING_LIST = {"type": "array", "items": STRING}
 QUESTION_ANSWER = {"type": "object", "additionalProperties": False, "required": ["id", "answer"], "properties": {"id": STRING, "answer": STRING}}
-FINDING = {"type": "object", "additionalProperties": False, "required": ["id", "claim", "severity", "evidence", "reasoning_summary"], "properties": {"id": STRING, "claim": STRING, "severity": {"type": "string", "enum": ["blocking", "non_blocking"]}, "evidence": STRING_LIST, "reasoning_summary": STRING, "required_change": STRING}}
+FINDING = {"type": "object", "additionalProperties": False, "required": ["id", "claim", "severity", "evidence", "reasoning_summary"], "properties": {"id": STRING, "claim": STRING, "severity": {"type": "string", "enum": ["blocking", "non_blocking"]}, "evidence": STRING_LIST, "reasoning_summary": STRING}}
 CAUSE = {"type": "object", "additionalProperties": False, "required": ["id", "cause", "evidence"], "properties": {"id": STRING, "cause": STRING, "evidence": STRING_LIST}}
 PATH = {"type": "object", "additionalProperties": False, "required": ["id", "action", "rationale"], "properties": {"id": STRING, "action": STRING, "rationale": STRING}}
-RISK = {"type": "object", "additionalProperties": False, "required": ["id", "risk", "impact"], "properties": {"id": STRING, "risk": STRING, "impact": STRING, "control": STRING}}
+RISK = {"type": "object", "additionalProperties": False, "required": ["id", "risk", "impact"], "properties": {"id": STRING, "risk": STRING, "impact": STRING}}
 CLAIM = {"type": "object", "additionalProperties": False, "required": ["claim", "classification", "evidence"], "properties": {"claim": STRING, "classification": {"type": "string", "enum": ["supported", "unsupported", "uncertain"]}, "evidence": STRING_LIST}}
 DECISION = {"type": "object", "additionalProperties": False, "required": ["recommendation", "rationale"], "properties": {"recommendation": STRING, "rationale": STRING}}
 PLAN = {"type": "object", "additionalProperties": False, "required": ["steps", "stop_conditions"], "properties": {"steps": STRING_LIST, "stop_conditions": STRING_LIST}}
@@ -185,11 +185,34 @@ MODE_CONTRACTS: dict[str, dict[str, Any]] = {
     "final-review": {"verdicts": ("accept", "changes_required", "blocked"), "fields": {"claim_classifications": {"type": "array", "items": CLAIM}, "summary": STRING, "next_safe_step": STRING}},
 }
 MODE_FIELDS = {mode: ("verdict", *contract["fields"].keys(), "question_answers") for mode, contract in MODE_CONTRACTS.items()}
+TRANSPORT_SCHEMA_ALLOWLIST = {"type", "properties", "required", "additionalProperties", "items", "enum", "description"}
 
-def response_schema(mission_id: str | None = None, mode: str = "integrated-review", model: str | None = None, effort: str | None = None, execution: int | None = None, snapshot: str | None = None, schema_version: str = RESPONSE_SCHEMA) -> dict[str, Any]:
+def local_semantic_contract(mode: str = "integrated-review", schema_version: str = RESPONSE_SCHEMA) -> dict[str, Any]:
     contract = MODE_CONTRACTS[mode]
     properties = {"schema_version": {"type": "string", "const": schema_version}, "verdict": {"type": "string", "enum": list(contract["verdicts"])}, "question_answers": {"type": "array", "items": QUESTION_ANSWER}, **contract["fields"]}
     return {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object", "additionalProperties": False, "required": list(properties), "properties": properties}
+
+def _conservative_transport_shape(value: Any) -> Any:
+    if isinstance(value, list): return [_conservative_transport_shape(item) for item in value]
+    if not isinstance(value, dict): return value
+    out: dict[str, Any] = {}
+    for key, child in value.items():
+        if key not in TRANSPORT_SCHEMA_ALLOWLIST: continue
+        if key == "properties" and isinstance(child, dict):
+            out[key] = {name: _conservative_transport_shape(schema) for name, schema in child.items()}
+        else:
+            out[key] = _conservative_transport_shape(child)
+    if out.get("additionalProperties") is False and isinstance(out.get("properties"), dict):
+        # The backend's strict-output dialect requires every declared property
+        # to be listed in required; local semantics retain true optionality.
+        out["required"] = list(out["properties"])
+    return out
+
+def backend_transport_schema(mode: str = "integrated-review") -> dict[str, Any]:
+    return _conservative_transport_shape(local_semantic_contract(mode))
+
+def response_schema(mission_id: str | None = None, mode: str = "integrated-review", model: str | None = None, effort: str | None = None, execution: int | None = None, snapshot: str | None = None, schema_version: str = RESPONSE_SCHEMA) -> dict[str, Any]:
+    return backend_transport_schema(mode)
 
 def _legacy_errors(value: Any, mission_id: str, mode: str, model: str, effort: str, questions: list[Any], snapshot: str) -> list[str]:
     if not isinstance(value, dict): return ["response must be an object"]
@@ -213,7 +236,7 @@ def validate_response(value: Any, mission_id: str, mode: str, model: str, effort
     if isinstance(value, dict) and value.get("schema_version") == LEGACY_RESPONSE_SCHEMA:
         return _legacy_errors(value, mission_id, mode, model, effort, questions, snapshot) if allow_legacy else ["legacy v1 response requires --legacy-response-v1"]
     if not isinstance(value, dict): return ["response must be an object"]
-    schema = response_schema(mode=mode); errors = schema_errors(value, schema)
+    schema = local_semantic_contract(mode=mode); errors = schema_errors(value, schema)
     if value.get("schema_version") != RESPONSE_SCHEMA: errors.append("schema_version must equal v2")
     expected_ids = [str(q.get("id")) if isinstance(q, dict) else f"Q{i + 1}" for i, q in enumerate(questions)]
     answers = value.get("question_answers", [])
@@ -223,6 +246,10 @@ def validate_response(value: Any, mission_id: str, mode: str, model: str, effort
     if mode == "merge-gate":
         if value.get("verdict") == "accept" and (value.get("safe_to_merge") is not True or value.get("blocking_findings") != [] or value.get("required_actions") != []): errors.append("merge-gate accept is inconsistent")
         if value.get("verdict") != "accept" and value.get("safe_to_merge") is not False: errors.append("merge-gate non-accept must be unsafe")
+        if value.get("verdict") == "changes_required" and not value.get("blocking_findings") and not value.get("required_actions"): errors.append("merge-gate changes_required requires a finding or action")
+        if value.get("verdict") == "blocked" and not value.get("blocking_findings"): errors.append("merge-gate blocked requires blocking evidence")
+    if mode == "plan-review" and value.get("verdict") == "accept" and (value.get("blocking_findings") != [] or value.get("required_actions") != []): errors.append("plan-review accept is inconsistent")
+    if mode == "integrated-review" and value.get("verdict") == "accept" and value.get("findings") != []: errors.append("integrated-review accept is inconsistent")
     return errors
 
 def schema_errors(value: Any, schema: dict[str, Any], path: str = "$") -> list[str]:
@@ -278,8 +305,25 @@ def sanitize_stderr(stderr: str, limit: int = 400) -> str:
     value = re.sub(r"(?<![A-Za-z0-9_.-])/(?:[^\s'\"]+)", "[PRIVATE_PATH]", value)
     return " ".join(value.split())[:limit]
 
-def classify_transport_failure(stderr: str) -> str:
-    text = stderr.casefold()
+def transport_event_summary(stdout: str, limit: int = 4) -> list[str]:
+    summary: list[str] = []
+    for line in stdout.splitlines():
+        try: event = json.loads(line)
+        except json.JSONDecodeError: continue
+        if not isinstance(event, dict): continue
+        if event.get("type") == "error":
+            error = event.get("error", {})
+            code = error.get("code") if isinstance(error, dict) else None
+            message = error.get("message") if isinstance(error, dict) else event.get("message", "")
+            summary.append(f"jsonl error: {code}" if isinstance(code, str) and code else f"jsonl error: {sanitize_stderr(str(message), 240)}")
+        elif event.get("type") == "turn.failed": summary.append("turn.failed")
+        if len(summary) >= limit: break
+    return summary
+
+def classify_transport_failure(stderr: str, stdout: str = "") -> str:
+    events = transport_event_summary(stdout)
+    if any("invalid_json_schema" in item for item in events): return "SCHEMA_OR_REQUEST_REJECTION"
+    text = (stderr + "\n" + "\n".join(events)).casefold()
     categories = (
         ("CLI_ARGUMENT_ERROR", ("unknown option", "unrecognized option", "unexpected argument", "cannot be used multiple times", "invalid value for", "requires a value")),
         ("AUTHENTICATION_ERROR", ("not logged in", "authentication", "login required", "unauthorized", "forbidden", "401", "403")),
@@ -390,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
                     if timeout: detailed = "TIMEOUT"; break
                     if rc != 0:
                         detailed = "TRANSPORT_ERROR"
-                        transport = {"transport_exit_code": rc, "transport_category": classify_transport_failure(stderr), "stderr_summary": sanitize_stderr(stderr), "stderr_fingerprint": hashlib.sha256(stderr.encode()).hexdigest()}
+                        transport = {"transport_exit_code": rc, "transport_category": classify_transport_failure(stderr, stdout), "stderr_summary": sanitize_stderr(stderr), "stderr_fingerprint": hashlib.sha256(stderr.encode()).hexdigest(), "transport_event_summary": transport_event_summary(stdout)}
                         retries += int(attempt < args.transport_retries)
                         continue
                     if diagnostics or tools or turns != 1 or not terminal: detailed = "SINGLE_PASS_CONTRACT_VIOLATION"; break

@@ -241,6 +241,119 @@ class ConsultProductTests(unittest.TestCase):
         for mode in self.mod.MODES:
             self.assertNotIn("uniqueItems", keys(self.mod.response_schema(mode=mode)), mode)
 
+    def test_transport_schemas_use_only_the_conservative_backend_allowlist(self):
+        allowlist = {"type", "properties", "required", "additionalProperties", "items", "enum", "description"}
+
+        def keywords(value, property_map=False):
+            if isinstance(value, dict):
+                found = set() if property_map else set(value)
+                for key, child in value.items():
+                    found |= keywords(child, key == "properties")
+                return found
+            if isinstance(value, list):
+                return set().union(*(keywords(child) for child in value)) if value else set()
+            return set()
+
+        for mode in self.mod.MODES:
+            self.assertTrue(keywords(self.mod.backend_transport_schema(mode)).issubset(allowlist), mode)
+
+    def test_transport_strict_objects_require_every_declared_property(self):
+        def violations(schema):
+            found = []
+            if isinstance(schema, dict):
+                properties = schema.get("properties")
+                if isinstance(properties, dict) and schema.get("additionalProperties") is False:
+                    if set(schema.get("required", ())) != set(properties):
+                        found.append(sorted(set(properties) - set(schema.get("required", ()))))
+                for child in schema.values():
+                    found.extend(violations(child))
+            elif isinstance(schema, list):
+                for child in schema:
+                    found.extend(violations(child))
+            return found
+
+        for mode in self.mod.MODES:
+            self.assertEqual(violations(self.mod.backend_transport_schema(mode)), [], mode)
+
+    def test_transport_contracts_exclude_conditional_singular_fields(self):
+        def property_names(schema):
+            found = set()
+            if isinstance(schema, dict):
+                if isinstance(schema.get("properties"), dict):
+                    found |= set(schema["properties"])
+                for child in schema.values():
+                    found |= property_names(child)
+            elif isinstance(schema, list):
+                for child in schema:
+                    found |= property_names(child)
+            return found
+
+        for mode in self.mod.MODES:
+            names = property_names(self.mod.backend_transport_schema(mode))
+            self.assertNotIn("required_change", names, mode)
+            self.assertNotIn("control", names, mode)
+
+    def test_merge_gate_blocked_requires_blocking_evidence(self):
+        payload = v2_response("merge-gate", ("Q1",))
+        blocked = dict(payload, verdict="blocked", safe_to_merge=False,
+                       blocking_findings=[], required_actions=["Stop the release."])
+        self.assertTrue(self.mod.validate_response(blocked, "m", "merge-gate", "model", "low",
+                                                   [{"id": "Q1", "text": "Question"}], "a" * 40))
+
+    def test_accept_like_verdicts_reject_findings_or_actions(self):
+        questions = [{"id": "Q1", "text": "Question"}]
+        finding = {"id": "F-1", "claim": "Unexpected change", "severity": "blocking",
+                   "evidence": ["Observed in the supplied diff."], "reasoning_summary": "Requires review."}
+        plan_review = dict(v2_response("plan-review", ("Q1",)), required_actions=["Change the plan."])
+        integrated = dict(v2_response("integrated-review", ("Q1",)), findings=[finding])
+        self.assertTrue(self.mod.validate_response(plan_review, "m", "plan-review", "model", "low", questions, "a" * 40))
+        self.assertTrue(self.mod.validate_response(integrated, "m", "integrated-review", "model", "low", questions, "a" * 40))
+
+    def test_canonical_response_for_every_mode_verdict_passes_both_layers(self):
+        questions = [{"id": "Q1", "text": "Question"}]
+        finding = {"id": "F-1", "claim": "Blocking evidence", "severity": "blocking",
+                   "evidence": ["Supplied evidence."], "reasoning_summary": "The gate cannot proceed."}
+        for mode, contract in self.mod.MODE_CONTRACTS.items():
+            for verdict in contract["verdicts"]:
+                payload = v2_response(mode, ("Q1",))
+                payload["verdict"] = verdict
+                if mode == "merge-gate" and verdict != "accept":
+                    payload["safe_to_merge"] = False
+                    payload["blocking_findings"] = [finding]
+                transport = jsonschema.Draft202012Validator(self.mod.backend_transport_schema(mode))
+                self.assertFalse(list(transport.iter_errors(payload)), f"transport {mode} {verdict}")
+                self.assertEqual(self.mod.validate_response(payload, "m", mode, "model", "low", questions, "a" * 40), [],
+                                 f"local {mode} {verdict}")
+
+    def test_invalid_json_schema_jsonl_event_is_a_schema_request_rejection(self):
+        stream = "\n".join(json.dumps(event) for event in [
+            {"type": "thread.started", "thread_id": "t-1"},
+            {"type": "turn.started"},
+            {"type": "error", "error": {"type": "invalid_request_error", "code": "invalid_json_schema",
+             "message": "Invalid schema for response_format"}, "status": 400},
+            {"type": "turn.failed"},
+        ])
+        self.assertEqual(self.mod.classify_transport_failure("", stream), "SCHEMA_OR_REQUEST_REJECTION")
+        self.assertEqual(self.mod.transport_event_summary(stream), ["jsonl error: invalid_json_schema", "turn.failed"])
+
+    def test_local_semantics_remain_stricter_than_transport_shape(self):
+        payload = v2_response("merge-gate", ("Q1",))
+        transport = jsonschema.Draft202012Validator(self.mod.backend_transport_schema("merge-gate"))
+        questions = [{"id": "Q1", "text": "Question"}]
+        for invalid in (
+            dict(payload, question_answers=[{"id": "Q1", "answer": ""}]),
+            dict(payload, question_answers=[{"id": "Q1", "answer": "yes"}, {"id": "Q1", "answer": "again"}]),
+            dict(payload, question_answers=[]),
+            dict(payload, verdict="not-a-verdict"),
+            dict(payload, safe_to_merge=False),
+            dict(payload, verdict="changes_required", safe_to_merge=False,
+                 blocking_findings=[], required_actions=[]),
+        ):
+            self.assertTrue(self.mod.validate_response(invalid, "m", "merge-gate", "model", "low", questions, "a" * 40))
+        self.assertFalse(list(transport.iter_errors(dict(payload, question_answers=[{"id": "Q1", "answer": ""}]))))
+        self.assertTrue(list(transport.iter_errors(dict(payload, unexpected="no"))))
+        self.assertTrue(list(transport.iter_errors(dict(payload, safe_to_merge="yes"))))
+
     def test_validate_response_rejects_snapshot_mismatch(self):
         valid = response(mode="merge-gate", snapshot="a" * 40)
         errors = self.mod.validate_response(valid, "mission-1", "merge-gate", "gpt-5.6-sol", "low",

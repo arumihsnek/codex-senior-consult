@@ -16,7 +16,9 @@ The bundle must contain no credentials, private paths, full history, or unnecess
 
 The target model returns only the mode payload and `schema_version: codex-senior-consult-response/v2`. The wrapper owns and records mission ID, mode, model, effort, snapshot fingerprint, normalized bundle fingerprint, execution ID, and replacement linkage. These are not copied metadata requirements for the target response.
 
-All mode schemas are strict and reject additional properties. Focused contracts are:
+The authoritative mode contract generates two artifacts. The transport schema is intentionally conservative and uses only `type`, `properties`, `required`, `additionalProperties`, `items`, and mode verdict `enum`. It is the schema sent to Codex. The local semantic contract retains non-empty fields, exact question coverage, cross-field invariants, snapshot checks, and every other strict v2 rule. A backend-valid response is only structurally valid; it becomes an advisory verdict only after local semantic validation succeeds.
+
+All mode transport schemas are strict about object shape and reject additional properties. In the backend strict-output dialect, every declared property is also transport-required; local semantic validation retains the distinction between required and optional meaning. Focused contracts are:
 
 ```json
 {
@@ -30,7 +32,7 @@ Every v2 mode also requires `question_answers`, an array of `{ "id": "Q1", "answ
 
 The bounded verdict vocabularies are: `merge-gate`, `integrated-review`, `plan-review`, and `final-review`: `accept | changes_required | blocked`; `blocker-analysis`: `continue | human_required | blocked`; `replan`, `plan`, and `risk-audit`: `continue | changes_required | blocked`. For `merge-gate`, `accept` requires `safe_to_merge: true`, `blocking_findings: []`, and `required_actions: []`; every non-accept verdict requires `safe_to_merge: false`. Contradictions are invalid, not advisory verdicts.
 
-All arrays are audited: action and stop-condition arrays contain non-empty strings; findings, causes, paths, risks, and claim classifications have strict small object shapes. `decision` and `plan` are objects in both JSON Schema and local validation; they are never accepted as arbitrary lists. The Codex structured-output endpoint rejects `uniqueItems`, so exact question-ID uniqueness is enforced by the local semantic validator rather than an unsupported schema keyword.
+All arrays are audited: action and stop-condition arrays contain non-empty strings; findings, causes, paths, risks, and claim classifications have strict small object shapes. Conditional singular fields such as `required_change` and `control` are not transported; plural arrays use deterministic empty values when nothing applies. `decision` and `plan` are objects in both JSON Schema and local validation; they are never accepted as arbitrary lists. The transport schema deliberately excludes `uniqueItems`, `minItems`, `maxItems`, `minLength`, `maxLength`, `pattern`, `format`, `contains`, `dependentRequired`, `oneOf`, `allOf`, `not`, `if`/`then`/`else`, `unevaluatedProperties`, and `propertyNames`. Exact question-ID uniqueness and coverage, non-empty values, array cardinality where required, verdict vocabulary, merge consistency, replacement linkage, and snapshot identity are enforced locally.
 
 ## v1 transition
 
@@ -38,7 +40,7 @@ Legacy v1 responses that repeat wrapper metadata and question text are accepted 
 
 ## Failure and replacement
 
-`NO_VERDICT_PROTOCOL_FAILURE` is the semantic status for a failed execution. Its `detailed_status` preserves the cause: `MALFORMED_SUPERIOR_RESPONSE`, `SINGLE_PASS_CONTRACT_VIOLATION`, `TRANSPORT_ERROR`, or `TIMEOUT`. A `TRANSPORT_ERROR` retains the process exit code, a bounded redacted stderr summary and fingerprint, and an evidence-based category: `CLI_ARGUMENT_ERROR`, `AUTHENTICATION_ERROR`, `MODEL_UNAVAILABLE`, `RATE_LIMIT_OR_QUOTA`, `NETWORK_OR_SERVICE_ERROR`, or `UNKNOWN_TRANSPORT_ERROR`. No failure is interpreted as `accept`, `changes_required`, or `blocked`.
+`NO_VERDICT_PROTOCOL_FAILURE` is the semantic status for a failed execution. Its `detailed_status` preserves the cause: `MALFORMED_SUPERIOR_RESPONSE`, `SINGLE_PASS_CONTRACT_VIOLATION`, `TRANSPORT_ERROR`, or `TIMEOUT`. A `TRANSPORT_ERROR` retains the process exit code, bounded redacted stderr and top-level JSONL error summaries, fingerprints, and an evidence-based category: `SCHEMA_OR_REQUEST_REJECTION`, `CLI_ARGUMENT_ERROR`, `AUTHENTICATION_ERROR`, `MODEL_UNAVAILABLE`, `RATE_LIMIT_OR_QUOTA`, `NETWORK_OR_SERVICE_ERROR`, or `UNKNOWN_TRANSPORT_ERROR`. No failure is interpreted as `accept`, `changes_required`, or `blocked`.
 
 `--replacement-for EXECUTION_ID` is caller initiated and never automatic. Before transport, the wrapper verifies that the referenced entry exists, has no valid verdict, is not itself a replacement, has no prior replacement, and matches mission, mode, model, effort, snapshot, and normalized bundle fingerprint. The replacement uses a fresh process and the same prompt material. A second replacement, replacement after a valid verdict, changed material, or cache hit is rejected. Transport retries are a separate explicit legacy allowance and are counted; they are not content retries.
 
