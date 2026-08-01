@@ -179,7 +179,7 @@ class ConsultProductTests(unittest.TestCase):
 
     def test_response_schema_requires_exact_snapshot(self):
         schema = self.mod.response_schema("mission-1", "merge-gate", "gpt-5.6-sol", "medium", 1, "a" * 40)
-        self.assertIn("snapshot", schema["required"])
+        self.assertNotIn("snapshot", schema["required"])
         self.assertEqual(schema["properties"]["snapshot"]["const"], "a" * 40)
 
     def test_validate_response_rejects_snapshot_mismatch(self):
@@ -295,7 +295,7 @@ class ConsultProductTests(unittest.TestCase):
     def test_malformed_response_has_no_repair_call(self):
         proc = self.invoke(complete_bundle(), malformed=True)
         out = self.parsed(proc)
-        self.assertEqual(out["status"], "MALFORMED_SUPERIOR_RESPONSE")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "MALFORMED_SUPERIOR_RESPONSE"))
         self.assertEqual(out["repair_executions"], 0)
         self.assertEqual(self.counter.read_text(), "1")
 
@@ -310,7 +310,7 @@ class ConsultProductTests(unittest.TestCase):
     def test_tool_call_is_contract_violation_without_relaunch(self):
         proc = self.invoke(complete_bundle(), tool=True)
         out = self.parsed(proc)
-        self.assertEqual(out["status"], "SINGLE_PASS_CONTRACT_VIOLATION")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "SINGLE_PASS_CONTRACT_VIOLATION"))
         self.assertEqual(out["tool_calls_observed"], 1)
         self.assertEqual(self.counter.read_text(), "1")
 
@@ -330,7 +330,7 @@ class ConsultProductTests(unittest.TestCase):
         payload["unexpected"] = "must not be accepted"
         proc = self.invoke(complete_bundle(), payload=payload)
         out = self.parsed(proc)
-        self.assertEqual(out["status"], "MALFORMED_SUPERIOR_RESPONSE")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "MALFORMED_SUPERIOR_RESPONSE"))
         self.assertEqual(out["repair_executions"], 0)
 
     def test_invalid_finding_types_and_container_severity_are_malformed(self):
@@ -340,7 +340,7 @@ class ConsultProductTests(unittest.TestCase):
             "evidence": "not-an-array", "reasoning_summary": "bad", "required_change": 42,
         }]
         out = self.parsed(self.invoke(complete_bundle(), payload=payload))
-        self.assertEqual(out["status"], "MALFORMED_SUPERIOR_RESPONSE")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "MALFORMED_SUPERIOR_RESPONSE"))
 
     def test_merge_gate_verdict_safe_flag_and_blockers_must_be_consistent(self):
         bundle = complete_bundle(mode="merge-gate")
@@ -351,7 +351,7 @@ class ConsultProductTests(unittest.TestCase):
             "required_change": "Supply runtime proof",
         }]
         out = self.parsed(self.invoke(bundle, payload=payload))
-        self.assertEqual(out["status"], "MALFORMED_SUPERIOR_RESPONSE")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "MALFORMED_SUPERIOR_RESPONSE"))
 
     def test_invalid_jsonl_fails_closed_as_contract_violation(self):
         bundle = complete_bundle()
@@ -365,7 +365,8 @@ class ConsultProductTests(unittest.TestCase):
              "--mode", bundle["mode"], "--mission-id", bundle["mission_id"],
              "--ledger", str(self.ledger), "--cache-dir", str(self.cache)],
             text=True, capture_output=True, env=self.env_for(fake), timeout=10)
-        self.assertEqual(self.parsed(proc)["status"], "SINGLE_PASS_CONTRACT_VIOLATION")
+        parsed = self.parsed(proc)
+        self.assertEqual((parsed["status"], parsed["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "SINGLE_PASS_CONTRACT_VIOLATION"))
 
     def test_corrupt_cache_is_rejected_without_exec(self):
         bundle = complete_bundle()
@@ -394,7 +395,7 @@ class ConsultProductTests(unittest.TestCase):
         questions = [f"Q{i}: Is risk {i} controlled?" for i in range(1, 7)]
         proc = self.invoke(complete_bundle(questions=questions), payload=response())
         out = self.parsed(proc)
-        self.assertEqual(out["status"], "MALFORMED_SUPERIOR_RESPONSE")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "MALFORMED_SUPERIOR_RESPONSE"))
         self.assertEqual(self.counter.read_text(), "1")
 
     def test_recursion_is_blocked_before_exec(self):
@@ -426,7 +427,7 @@ class ConsultProductTests(unittest.TestCase):
     def test_transport_retry_requires_explicit_flag_and_counts_execution(self):
         proc = self.invoke(complete_bundle(), fail_transport=True)
         out = self.parsed(proc)
-        self.assertEqual(out["status"], "TRANSPORT_ERROR")
+        self.assertEqual((out["status"], out["detailed_status"]), ("NO_VERDICT_PROTOCOL_FAILURE", "TRANSPORT_ERROR"))
         self.assertEqual(out["transport_retries"], 0)
         self.assertEqual(self.counter.read_text(), "1")
 
@@ -534,6 +535,91 @@ class ConsultProductTests(unittest.TestCase):
         }
         out = self.parsed(self.invoke(deterministic))
         self.assertEqual((out["status"], out["superior_sessions"]), ("ESCALATION_NOT_JUSTIFIED", 0))
+
+    def test_v2_focused_mode_contracts_do_not_require_wrapper_metadata(self):
+        for mode, payload in {
+            "merge-gate": {"verdict": "accept", "safe_to_merge": True,
+                           "blocking_findings": [], "required_actions": [],
+                           "residual_risks": [], "summary": "safe"},
+            "blocker-analysis": {"verdict": "continue", "ranked_causes": [],
+                                 "continuation_paths": [], "recommended_path": "local",
+                                 "cheapest_discriminating_experiment": "inspect",
+                                 "stop_conditions": [], "next_safe_step": "inspect"},
+            "replan": {"verdict": "replan", "invalidated_assumptions": [],
+                       "plan_delta": [], "closed_phases_preserved": [],
+                       "new_stop_conditions": [], "next_safe_step": "inspect"},
+        }.items():
+            payload["schema_version"] = "codex-senior-consult-response/v2"
+            self.assertEqual(self.mod.validate_response(payload, "m", mode, "model", "low", [], "x" * 64),
+                             [])
+
+    def test_malformed_response_is_no_verdict_and_exposes_execution_id(self):
+        out = self.parsed(self.invoke(complete_bundle(), malformed=True))
+        self.assertEqual(out["status"], "NO_VERDICT_PROTOCOL_FAILURE")
+        self.assertEqual(out["detailed_status"], "MALFORMED_SUPERIOR_RESPONSE")
+        self.assertIsNone(out["verdict"])
+        self.assertTrue(out["execution_id"])
+
+    def test_one_explicit_replacement_is_fresh_and_linked(self):
+        first = self.parsed(self.invoke(complete_bundle(), malformed=True))
+        second = self.parsed(self.invoke(complete_bundle(), payload=response(),
+                                         extra=["--replacement-for", first["execution_id"]]))
+        self.assertEqual(second["status"], "COMPLETED")
+        self.assertEqual(second["replacement_for"], first["execution_id"])
+        entries = [json.loads(line) for line in self.ledger.read_text().splitlines()]
+        self.assertEqual(entries[-1]["replacement_for"], first["execution_id"])
+        self.assertEqual(self.counter.read_text(), "2")
+
+    def test_second_replacement_and_replacement_after_valid_verdict_are_rejected(self):
+        first = self.parsed(self.invoke(complete_bundle(), malformed=True))
+        second = self.parsed(self.invoke(complete_bundle(), payload=response(),
+                                         extra=["--replacement-for", first["execution_id"]]))
+        rejected = self.parsed(self.invoke(complete_bundle(), payload=response(),
+                                           extra=["--replacement-for", first["execution_id"]]))
+        self.assertEqual(rejected["status"], "REPLACEMENT_NOT_AUTHORIZED")
+        valid = self.parsed(self.invoke(complete_bundle("valid")))
+        unwanted = self.parsed(self.invoke(complete_bundle("valid"), payload=response()))
+        self.assertIn(unwanted["status"], {"CACHE_HIT", "COMPLETED"})
+        self.assertEqual(second["status"], "COMPLETED")
+        self.assertEqual(valid["status"], "COMPLETED")
+
+    def test_secret_scope_descriptions_pass_but_ambiguous_credentials_fail_closed(self):
+        bundle = complete_bundle()
+        bundle["observed_facts"] = [{"secret_scope": "contract metadata; values are redacted",
+                                     "authentication_contract": "caller supplies no credentials"}]
+        self.assertEqual(self.mod.secret_locations(bundle), [])
+        bundle["observed_facts"].append({"client_secret": "unknown-value"})
+        self.assertTrue(self.mod.secret_locations(bundle))
+
+    def test_status_separates_process_and_verdict_counters(self):
+        self.invoke(complete_bundle())
+        out = self.parsed(subprocess.run(
+            [sys.executable, str(SCRIPT), "--status", "--mission-id", "mission-1",
+             "--ledger", str(self.ledger), "--cache-dir", str(self.cache)],
+            text=True, capture_output=True, timeout=10))
+        self.assertEqual(out["process_attempts"], 1)
+        self.assertEqual(out["valid_verdicts"], 1)
+        self.assertEqual(out["protocol_failures"], 0)
+        self.assertEqual(out["replacement_attempts"], 0)
+
+    def test_replacement_with_changed_snapshot_is_rejected_before_transport(self):
+        first = self.parsed(self.invoke(complete_bundle(), malformed=True))
+        changed = complete_bundle()
+        changed["snapshot"]["checkpoint_fingerprint"] = "f" * 64
+        out = self.parsed(self.invoke(changed, payload=response(),
+                                      extra=["--replacement-for", first["execution_id"]]))
+        self.assertEqual(out["status"], "REPLACEMENT_NOT_AUTHORIZED")
+        self.assertEqual(self.counter.read_text(), "1")
+
+    def test_v2_merge_gate_cli_uses_focused_response_without_metadata(self):
+        bundle = complete_bundle("v2", "merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v2"}
+        payload = {"schema_version": "codex-senior-consult-response/v2", "verdict": "accept",
+                   "safe_to_merge": True, "blocking_findings": [], "required_actions": [],
+                   "residual_risks": [], "summary": "safe"}
+        out = self.parsed(self.invoke(bundle, payload=payload))
+        self.assertEqual(out["status"], "COMPLETED")
+        self.assertEqual(out["response"], payload)
 
 
 if __name__ == "__main__":
