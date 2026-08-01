@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Senior Consult"
+  short_description: "Bounded single-pass consultations with a senior model"
+  default_prompt: "Use $codex-senior-consult to prepare and run one bounded senior consultation for this mission."
