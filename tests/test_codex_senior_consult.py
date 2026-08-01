@@ -444,7 +444,11 @@ class ConsultProductTests(unittest.TestCase):
         self.assertNotIn("OPENAI_API_KEY", child)
         self.assertNotIn("ANTHROPIC_API_KEY", child)
         self.assertNotIn("AUTHORIZATION", child)
-        self.assertTrue(set(child).issubset({"PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "CODEX_HOME", "CODEX_SENIOR_CONSULT_ACTIVE"}))
+        allowed = {"PATH", "HOME", "USER", "LANG", "LC_ALL", "TMPDIR", "CODEX_HOME", "CODEX_SENIOR_CONSULT_ACTIVE"}
+        # Assert the wrapper boundary directly. Python may add LC_CTYPE inside
+        # the fake CLI while coercing an unavailable parent locale; that value
+        # was not inherited or supplied by child_environment().
+        self.assertTrue(set(self.mod.child_environment()).issubset(allowed))
 
     def test_transport_failure_retains_sanitized_actionable_diagnostics(self):
         proc = self.invoke(complete_bundle(), fail_transport=True,
