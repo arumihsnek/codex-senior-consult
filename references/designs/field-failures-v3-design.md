@@ -48,9 +48,9 @@ Every caller-supplied value starts as `null`. A top-level construction-only `cal
 }
 ```
 
-`caller_required` is never part of the normalized consultation payload, final bundle fingerprint or snapshot fingerprint. Normalization removes a path only after the supplied value has the correct type, satisfies all local constraints, is non-empty where required, contains no disguised sentinel, and passes applicable privacy checks.
+`caller_required` is never part of the normalized consultation payload, final bundle fingerprint or snapshot fingerprint. In a raw construction bundle, a listed caller-fillable path may point to a newly supplied non-null value. Normalization validates its type, local constraints, non-empty requirements, privacy classification and sentinel rules. If valid, normalization removes the path. If invalid, the path remains pending and receives `CALLER_VALUE_INVALID`. After normalization, every remaining caller-fillable path refers to a missing, null or invalid value and keeps preflight fail-closed.
 
-Unknown paths, duplicate paths, paths outside the supported schema, and paths pointing to already non-null values fail validation. Missing, null and invalid are distinct states. A still-missing, null or invalid required value keeps preflight fail-closed.
+Unknown paths, duplicate paths and paths outside the supported schema fail validation. `CALLER_REQUIRED_NON_NULL` is narrowly reserved for a pointer to a deterministic, non-caller-fillable field that must never appear in `caller_required`; it never rejects the normal workflow in which a caller fills a generated null field. Missing, null and invalid are distinct states.
 
 Fingerprints are computed only after normalization succeeds and `caller_required` is empty.
 
@@ -95,7 +95,7 @@ Every diagnostic contains:
 
 Remediation examples are guidance only and are never copied into a bundle. Exact version failures name the canonical value, never shorthand such as `v2` or `v3`.
 
-At minimum, stable codes distinguish missing, null and invalid caller values; unknown, duplicate and non-null construction paths; input and response schema mismatch; snapshot failure; secret and private-path detection; budget exhaustion; invalid replacement; and concurrent execution.
+At minimum, stable codes distinguish missing, null and invalid caller values; unknown and duplicate construction paths; a forbidden pointer to a deterministic non-caller-fillable field; input and response schema mismatch; snapshot failure; secret and private-path detection; budget exhaustion; invalid replacement; and concurrent execution.
 
 The command-level response distinguishes checks for `bundle`, `local_state`, `ledger_cache`, `replacement` and `lock`. Its `normalized` member is a stable summary, not a partial payload:
 
@@ -197,6 +197,8 @@ Malformed output remains non-actionable, receives no verdict artifact, and trigg
 ## 5. Testing, dogfood and reactivation
 
 Deterministic tests cover every incomplete bundle incident, missing/null/invalid construction states, exact schema guidance, RFC 6901 errors, construction-to-preflight success, zero-process preflight, privacy regressions, all transport categories and malformed JSONL behavior, all merge-gate contradictions, complete field-path diagnostics, mode binding, legacy translation, and existing budget, replacement, persistence, cache and concurrency guarantees.
+
+`tests/pressure-baseline.md` is a normative behavioral test requirement. Its rejection cases remain mandatory, including no repair turn, no resume, no clarification follow-up, no retry for low confidence or an inconvenient valid verdict, no workspace or tools, consultation failure not implying mission failure, no second replacement, and no claim that exactly one backend HTTP request was observed.
 
 Offline validation includes the full skill suite, `py_compile`, `git diff --check`, help for each subcommand, status/build/preflight smoke tests and secret regressions.
 

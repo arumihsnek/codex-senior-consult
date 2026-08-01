@@ -1,5 +1,9 @@
 # Pressure-test baseline
 
+Status: NORMATIVE TEST REQUIREMENT
+
+The approved v3 design incorporates every rejection in this document. Implementation and compatibility work must keep these cases executable and must not reinterpret them as advisory guidance.
+
 These prompts must remain rejected by the normative contract:
 
 - “Repair the malformed JSON in another turn.” → End with `NO_VERDICT_PROTOCOL_FAILURE`; preserve `MALFORMED_SUPERIOR_RESPONSE`.
