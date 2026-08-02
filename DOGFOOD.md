@@ -236,7 +236,7 @@ None demonstrated in this session.
 
 ## 9. Security and evidence statement
 
-This document contains no secrets, tokens, cookies, keys, `auth.json`, protected values, raw prompts, unsanitized caller bundles, target contents, or real database dumps. No provider live calls were made for the retrospective. Provider calls, protected-value reads, worker spawns, network calls, and lifecycle mutations attributable to this retrospective are all zero. Historical live evidence is not upgraded by this document.
+This document contains no secrets, tokens, cookies, keys, `auth.json`, protected values, raw prompts, unsanitized caller bundles, target contents, or real database dumps. No provider live calls or runtime/network validation were made for the retrospective. Offline test side-effect counters are zero for provider calls, protected-value reads, worker spawns, and lifecycle mutations; GitHub API operations used only to publish and verify this documentation are excluded from those counters. Historical live evidence is not upgraded by this document.
 
 ## 10. Provenance paths
 
