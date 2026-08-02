@@ -1096,6 +1096,46 @@ class V3ConstructionPreflightTests(unittest.TestCase):
             self.assertEqual(result["model_processes_consumed"], 0)
             self.assertIn(expected_code, {d["code"] for d in result["diagnostics"]})
 
+    def test_preflight_rejects_non_string_caller_required_elements_without_echoing(self):
+        sensitive_object = {"api_key": "sk-abcdefghijklmnopqrstuvwxyz123456"}
+        sensitive_array = ["-----BEGIN PRIVATE KEY-----"]
+        cases = [sensitive_object, sensitive_array, None, True, 987654321, 98765.4321]
+        for value in cases:
+            bundle = complete_bundle(mode="merge-gate")
+            bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v3"}
+            bundle["caller_required"] = [value]
+            try:
+                result = self.mod.preflight_bundle(bundle, mission_id="mission-1", mode="merge-gate")
+            except TypeError as exc:
+                self.fail(f"preflight raised instead of returning a diagnostic: {type(exc).__name__}")
+            self.assertEqual((result["status"], result["valid"], result["model_processes_consumed"]),
+                             ("PREFLIGHT_INVALID", False, 0))
+            diagnostic = result["diagnostics"][0]
+            self.assertEqual(diagnostic["code"], "CALLER_REQUIRED_INVALID_ELEMENT")
+            self.assertEqual(diagnostic["path"], "/caller_required/0")
+            self.assertEqual(diagnostic["state"], "invalid")
+            self.assertEqual(diagnostic["expected"], {"type": "string containing an RFC 6901 pointer"})
+            self.assertNotIn(json.dumps(value), json.dumps(diagnostic, sort_keys=True))
+
+    def test_non_string_caller_required_element_does_not_suppress_later_diagnostics(self):
+        sensitive = {"authorization": "sk-abcdefghijklmnopqrstuvwxyz123456"}
+        bundle = complete_bundle(mode="merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v3"}
+        bundle["diff"] = None
+        bundle["caller_required"] = [sensitive, "/objective", "/objective", "/unknown", "/diff"]
+        try:
+            result = self.mod.preflight_bundle(bundle, mission_id="mission-1", mode="merge-gate")
+        except TypeError as exc:
+            self.fail(f"preflight raised instead of collecting later diagnostics: {type(exc).__name__}")
+        codes = {(d["code"], d["path"]) for d in result["diagnostics"]}
+        self.assertEqual((result["status"], result["valid"], result["model_processes_consumed"]),
+                         ("PREFLIGHT_INVALID", False, 0))
+        self.assertIn(("CALLER_REQUIRED_INVALID_ELEMENT", "/caller_required/0"), codes)
+        self.assertIn(("CALLER_REQUIRED_DUPLICATE_PATH", "/objective"), codes)
+        self.assertIn(("CALLER_REQUIRED_UNKNOWN_PATH", "/unknown"), codes)
+        self.assertIn(("CALLER_VALUE_NULL", "/diff"), codes)
+        self.assertNotIn(json.dumps(sensitive), json.dumps(result["diagnostics"], sort_keys=True))
+
     def test_preflight_distinguishes_null_and_suppresses_cascades_without_process(self):
         bundle = self.mod.build_bundle_skeleton("mission-1", "merge-gate", self.repo)
         with mock.patch.object(self.mod, "run_process", side_effect=AssertionError("model process consumed")):

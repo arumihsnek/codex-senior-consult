@@ -133,7 +133,9 @@ def normalize_construction_bundle(source: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(pointers, list):
         diagnostics.append(_diagnostic("CALLER_REQUIRED_INVALID", "/caller_required", "invalid", "caller_required must be an array", "array", "Use unique RFC 6901 pointers.")); pointers = []
     seen: set[str] = set(); remaining: list[str] = []
-    for pointer in pointers:
+    for index, pointer in enumerate(pointers):
+        if not isinstance(pointer, str):
+            diagnostics.append(_diagnostic("CALLER_REQUIRED_INVALID_ELEMENT", f"/caller_required/{index}", "invalid", "caller_required elements must be strings", "string containing an RFC 6901 pointer", "Replace the element with a supported RFC 6901 pointer.")); continue
         if pointer in seen:
             diagnostics.append(_diagnostic("CALLER_REQUIRED_DUPLICATE_PATH", str(pointer), "invalid", "duplicate caller-required path", "unique RFC 6901 pointer", "Remove the duplicate path.")); continue
         seen.add(pointer)
