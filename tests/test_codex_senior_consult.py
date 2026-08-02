@@ -197,6 +197,16 @@ pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_text(%r)
 
 
 class ConsultProductTests(unittest.TestCase):
+    def test_current_documentation_names_v3_and_labels_v2_as_historical(self):
+        skill = (ROOT / "SKILL.md").read_text()
+        contracts = (ROOT / "references" / "contracts.md").read_text()
+        examples = (ROOT / "references" / "examples.md").read_text()
+        self.assertIn("New consultations request `codex-senior-consult-response/v3`", skill)
+        self.assertIn("The historical response contract is version `codex-senior-consult-response/v2`", skill)
+        self.assertNotIn("The response contract is version `codex-senior-consult-response/v2`", skill)
+        self.assertIn("ordinary response schema is exactly `codex-senior-consult-response/v3`", contracts)
+        self.assertIn("Historical v2 merge gate", examples)
+
     def test_transport_stderr_is_bounded_and_redacted(self):
         module = load_module()
         value = module.sanitize_transport_stderr(
