@@ -12,7 +12,7 @@ python3 scripts/codex_senior_consult.py status --mission-id example
 
 Remediation examples are guidance, never defaults. Normal construction requests `codex-senior-consult-response/v3`; validate v1/v2 only as explicit historical compatibility.
 
-## New v2 merge gate
+## Historical v2 merge gate
 
 ```bash
 python3 scripts/codex_senior_consult.py --mode merge-gate \
