@@ -134,16 +134,17 @@ def normalize_construction_bundle(source: dict[str, Any]) -> dict[str, Any]:
         diagnostics.append(_diagnostic("CALLER_REQUIRED_INVALID", "/caller_required", "invalid", "caller_required must be an array", "array", "Use unique RFC 6901 pointers.")); pointers = []
     seen: set[str] = set(); remaining: list[str] = []
     for index, pointer in enumerate(pointers):
+        metadata_path = f"/caller_required/{index}"
         if not isinstance(pointer, str):
-            diagnostics.append(_diagnostic("CALLER_REQUIRED_INVALID_ELEMENT", f"/caller_required/{index}", "invalid", "caller_required elements must be strings", "string containing an RFC 6901 pointer", "Replace the element with a supported RFC 6901 pointer.")); continue
+            diagnostics.append(_diagnostic("CALLER_REQUIRED_INVALID_ELEMENT", metadata_path, "invalid", "caller_required elements must be strings", "string containing an RFC 6901 pointer", "Replace the element with a supported RFC 6901 pointer.")); continue
         if pointer in seen:
-            diagnostics.append(_diagnostic("CALLER_REQUIRED_DUPLICATE_PATH", str(pointer), "invalid", "duplicate caller-required path", "unique RFC 6901 pointer", "Remove the duplicate path.")); continue
+            diagnostics.append(_diagnostic("CALLER_REQUIRED_DUPLICATE_PATH", metadata_path, "invalid", "duplicate caller-required path", "unique RFC 6901 pointer", "Remove the duplicate path.")); continue
         seen.add(pointer)
         try: value = resolve_json_pointer(bundle, pointer)
         except (KeyError, ValueError, TypeError):
-            diagnostics.append(_diagnostic("CALLER_REQUIRED_UNKNOWN_PATH", str(pointer), "missing", "path is outside the supported construction schema", "supported RFC 6901 pointer", "Use a path emitted by build-bundle.")); continue
+            diagnostics.append(_diagnostic("CALLER_REQUIRED_UNKNOWN_PATH", metadata_path, "missing", "path is outside the supported construction schema", "supported RFC 6901 pointer", "Use a path emitted by build-bundle.")); continue
         if pointer not in CALLER_POINTERS:
-            diagnostics.append(_diagnostic("CALLER_REQUIRED_NON_NULL", pointer, "invalid", "deterministic fields must not be caller-fillable", "path absent from caller_required", "Remove this deterministic field path.")); continue
+            diagnostics.append(_diagnostic("CALLER_REQUIRED_NON_NULL", metadata_path, "invalid", "deterministic fields must not be caller-fillable", "path absent from caller_required", "Remove this deterministic field path.")); continue
         expected = EXPECTED_TYPES[pointer]
         if value is None:
             diagnostics.append(_diagnostic("CALLER_VALUE_NULL", pointer, "null", "caller-owned evidence is still null", expected[0].__name__, "Supply bounded sanitized mission evidence.")); remaining.append(pointer); continue

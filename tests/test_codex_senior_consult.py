@@ -1075,9 +1075,10 @@ class V3ConstructionPreflightTests(unittest.TestCase):
         bundle["caller_required"] += ["/objective", "/unknown", "/mode"]
         result = self.mod.normalize_construction_bundle(bundle)
         codes = {(d["code"], d["path"]) for d in result["diagnostics"]}
-        self.assertIn(("CALLER_REQUIRED_DUPLICATE_PATH", "/objective"), codes)
-        self.assertIn(("CALLER_REQUIRED_UNKNOWN_PATH", "/unknown"), codes)
-        self.assertIn(("CALLER_REQUIRED_NON_NULL", "/mode"), codes)
+        original_length = len(bundle["caller_required"]) - 3
+        self.assertIn(("CALLER_REQUIRED_DUPLICATE_PATH", f"/caller_required/{original_length}"), codes)
+        self.assertIn(("CALLER_REQUIRED_UNKNOWN_PATH", f"/caller_required/{original_length + 1}"), codes)
+        self.assertIn(("CALLER_REQUIRED_NON_NULL", f"/caller_required/{original_length + 2}"), codes)
 
     def test_preflight_rejects_every_invalid_caller_required_metadata_form(self):
         cases = [
@@ -1131,10 +1132,65 @@ class V3ConstructionPreflightTests(unittest.TestCase):
         self.assertEqual((result["status"], result["valid"], result["model_processes_consumed"]),
                          ("PREFLIGHT_INVALID", False, 0))
         self.assertIn(("CALLER_REQUIRED_INVALID_ELEMENT", "/caller_required/0"), codes)
-        self.assertIn(("CALLER_REQUIRED_DUPLICATE_PATH", "/objective"), codes)
-        self.assertIn(("CALLER_REQUIRED_UNKNOWN_PATH", "/unknown"), codes)
+        self.assertIn(("CALLER_REQUIRED_DUPLICATE_PATH", "/caller_required/2"), codes)
+        self.assertIn(("CALLER_REQUIRED_UNKNOWN_PATH", "/caller_required/3"), codes)
         self.assertIn(("CALLER_VALUE_NULL", "/diff"), codes)
         self.assertNotIn(json.dumps(sensitive), json.dumps(result["diagnostics"], sort_keys=True))
+
+    def test_sensitive_string_caller_required_metadata_is_indexed_and_never_echoed(self):
+        private_key_marker = "-----BEGIN PRIVATE KEY-----synthetic-only"
+        oversized = "/" + "x" * 8192 + "-credential-shaped-marker"
+        cases = [
+            ("malformed", "sk-synthetic-malformed-marker", ["CALLER_REQUIRED_UNKNOWN_PATH"]),
+            ("unknown", "/unknown/sk-synthetic-unknown-marker", ["CALLER_REQUIRED_UNKNOWN_PATH"]),
+            ("duplicate", "/sk-synthetic-duplicate-marker", ["CALLER_REQUIRED_NON_NULL", "CALLER_REQUIRED_DUPLICATE_PATH"]),
+            ("unsupported", "/sk-synthetic-deterministic-marker", ["CALLER_REQUIRED_NON_NULL"]),
+            ("invalid escape", "/unknown~2" + private_key_marker, ["CALLER_REQUIRED_UNKNOWN_PATH"]),
+            ("oversized", oversized, ["CALLER_REQUIRED_UNKNOWN_PATH"]),
+        ]
+        for label, pointer, expected_codes in cases:
+            with self.subTest(label=label):
+                bundle = complete_bundle(mode="merge-gate")
+                bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v3"}
+                if label in {"duplicate", "unsupported"}:
+                    bundle[pointer[1:]] = "synthetic resolved value"
+                bundle["caller_required"] = [pointer, pointer] if label == "duplicate" else [pointer]
+                try:
+                    result = self.mod.preflight_bundle(bundle, mission_id="mission-1", mode="merge-gate")
+                except Exception as exc:
+                    self.fail(f"preflight raised instead of returning indexed diagnostics: {type(exc).__name__}")
+                self.assertEqual((result["status"], result["valid"], result["model_processes_consumed"]),
+                                 ("PREFLIGHT_INVALID", False, 0))
+                self.assertEqual([d["code"] for d in result["diagnostics"]], expected_codes)
+                self.assertEqual([d["path"] for d in result["diagnostics"]],
+                                 [f"/caller_required/{index}" for index in range(len(expected_codes))])
+                self.assertNotIn(pointer, json.dumps(result, sort_keys=True))
+
+    def test_sensitive_malformed_string_preserves_order_and_later_value_diagnostics(self):
+        malformed = "-----BEGIN PRIVATE KEY-----synthetic-malformed"
+        unknown = "/unknown/sk-synthetic-later-marker"
+        bundle = complete_bundle(mode="merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v3"}
+        bundle["objective"] = []
+        bundle["diff"] = None
+        bundle["caller_required"] = [malformed, "/objective", "/objective", unknown, "/mode", "/diff"]
+        try:
+            result = self.mod.preflight_bundle(bundle, mission_id="mission-1", mode="merge-gate")
+        except Exception as exc:
+            self.fail(f"preflight raised instead of collecting ordered diagnostics: {type(exc).__name__}")
+        self.assertEqual((result["status"], result["valid"], result["model_processes_consumed"]),
+                         ("PREFLIGHT_INVALID", False, 0))
+        self.assertEqual([(d["code"], d["path"]) for d in result["diagnostics"]], [
+            ("CALLER_REQUIRED_UNKNOWN_PATH", "/caller_required/0"),
+            ("CALLER_VALUE_INVALID", "/objective"),
+            ("CALLER_REQUIRED_DUPLICATE_PATH", "/caller_required/2"),
+            ("CALLER_REQUIRED_UNKNOWN_PATH", "/caller_required/3"),
+            ("CALLER_REQUIRED_NON_NULL", "/caller_required/4"),
+            ("CALLER_VALUE_NULL", "/diff"),
+        ])
+        rendered = json.dumps(result, sort_keys=True)
+        self.assertNotIn(malformed, rendered)
+        self.assertNotIn(unknown, rendered)
 
     def test_preflight_distinguishes_null_and_suppresses_cascades_without_process(self):
         bundle = self.mod.build_bundle_skeleton("mission-1", "merge-gate", self.repo)
