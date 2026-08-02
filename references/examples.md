@@ -1,5 +1,17 @@
 # Examples
 
+## Caller-neutral v3 flow
+
+```bash
+python3 scripts/codex_senior_consult.py build-bundle --mission-id example --mode merge-gate --repository . --output bundle.json
+# Fill every null caller-owned field with bounded sanitized evidence.
+python3 scripts/codex_senior_consult.py preflight --mission-id example --mode merge-gate --bundle bundle.json --normalized-output normalized.json
+python3 scripts/codex_senior_consult.py consult --mission-id example --mode merge-gate --bundle bundle.json
+python3 scripts/codex_senior_consult.py status --mission-id example
+```
+
+Remediation examples are guidance, never defaults. Normal construction requests `codex-senior-consult-response/v3`; validate v1/v2 only as explicit historical compatibility.
+
 ## New v2 merge gate
 
 ```bash

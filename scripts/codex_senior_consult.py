@@ -18,7 +18,7 @@ import tempfile
 import uuid
 from typing import Any
 
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 BUNDLE_SCHEMA = "codex-senior-consult/v1"
 RESPONSE_SCHEMA = "codex-senior-consult-response/v2"
 V3_RESPONSE_SCHEMA = "codex-senior-consult-response/v3"
@@ -756,7 +756,13 @@ def main(argv: list[str] | None = None) -> int:
             codes = {d["code"] for d in local_preflight["diagnostics"]}
             status = "SECRET_DETECTED" if "SECRET_DETECTED" in codes else "PRIVATE_PATH_DETECTED" if "PRIVATE_PATH_DETECTED" in codes else "BUNDLE_INCOMPLETE"
             return emit({**base_metrics(status, args.mission_id), "diagnostics": local_preflight["diagnostics"], "details": [d["reason"] for d in local_preflight["diagnostics"]], "model_processes_consumed": 0}, 2)
-        bundle = local_preflight["payload"]; args.effort_triggers = sorted(set(args.critical)); args.effective_effort = "medium" if args.effort in {"low", "medium"} and args.effort_triggers else args.effort; args.response_schema_version = bundle["requested_output"].get("schema_version"); args.allow_legacy = args.legacy_response_v1 or args.response_schema_version == LEGACY_RESPONSE_SCHEMA; args.allow_historical = args.historical_response_v2 or args.response_schema_version == RESPONSE_SCHEMA
+        bundle = local_preflight["payload"]; args.effort_triggers = sorted(set(args.critical)); args.effective_effort = "medium" if args.effort in {"low", "medium"} and args.effort_triggers else args.effort; args.response_schema_version = bundle["requested_output"].get("schema_version")
+        if args.response_schema_version == LEGACY_RESPONSE_SCHEMA and not args.legacy_response_v1:
+            return emit({**base_metrics("BUNDLE_INCOMPLETE", args.mission_id), "details": ["historical v1 response creation requires --legacy-response-v1; ordinary consultations require codex-senior-consult-response/v3"], "model_processes_consumed": 0}, 2)
+        if args.response_schema_version == RESPONSE_SCHEMA and not args.historical_response_v2:
+            return emit({**base_metrics("BUNDLE_INCOMPLETE", args.mission_id), "details": ["historical v2 response creation requires --historical-response-v2; ordinary consultations require codex-senior-consult-response/v3"], "model_processes_consumed": 0}, 2)
+        args.allow_legacy = args.legacy_response_v1
+        args.allow_historical = args.historical_response_v2
         if not bundle["escalation"].get("justified", True): return emit({**base_metrics("ESCALATION_NOT_JUSTIFIED", args.mission_id), "superior_sessions": 0, "codex_exec_processes": 0}, 0)
         if args.workspace_read: return emit({**base_metrics("WORKSPACE_READ_UNSUPPORTED", args.mission_id), "details": ["workspace access cannot preserve zero tools"]}, 3)
         if args.dangerous_yolo: return emit({**base_metrics("DANGEROUS_YOLO_DISABLED", args.mission_id), "details": ["dangerous bypass is disabled"]}, 3)

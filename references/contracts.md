@@ -1,5 +1,11 @@
 # Contracts and Security Reference
 
+## V3 command and compatibility contract
+
+The ordinary caller workflow is `build-bundle`, `preflight`, `consult`, then `status`. Construction metadata uses `null` plus RFC 6901 `caller_required`; normalization removes valid filled paths and strips the metadata before fingerprinting or consultation. Preflight reports actionable field-path diagnostics and consumes zero Codex processes.
+
+The ordinary response schema is exactly `codex-senior-consult-response/v3` and is bound to the requested mode. Merge-gate v3 separates `blocking_findings`, `required_actions`, required-but-empty-allowed `non_blocking_observations`, and accepted `residual_risks`. V1/v2 response artifacts are historical read-only compatibility and are never produced by `build-bundle`.
+
 ## Ownership and execution boundary
 
 The caller is the calling agent or mission owner. The senior consultant is advisory. A consultation execution may terminate fail-closed while the mission owner continues locally or starts one explicitly authorized replacement execution; ending the execution does not end the surrounding mission.

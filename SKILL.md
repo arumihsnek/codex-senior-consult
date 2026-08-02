@@ -15,6 +15,10 @@ After a no-verdict protocol failure, the caller may initiate at most one fresh r
 
 ## Workflow
 
+Use `build-bundle -> preflight -> consult -> status`. `build-bundle` emits only deterministic local identity and represents caller evidence as `null` plus RFC 6901 `caller_required` paths. Preflight uses the same normalization and consumes zero Codex processes. The historical flat invocation is translated into `consult` and cannot bypass preflight.
+
+New consultations request `codex-senior-consult-response/v3`. V1/v2 response handling is historical read-only compatibility and is never the ordinary generated flow.
+
 1. Investigate locally and resolve deterministic questions without consultation.
 2. Apply the escalation gate; group unresolved questions in one bundle.
 3. Read [references/contracts.md](references/contracts.md), build the v1 input bundle, and pass local completeness, path, and secret gates.

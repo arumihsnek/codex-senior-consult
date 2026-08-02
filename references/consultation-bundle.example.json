@@ -18,7 +18,7 @@
   "constraints": ["Single pass", "No tools", "No workspace reads", "Advisory only"],
   "risks_already_identified": ["Protocol failures must not become verdicts."],
   "questions": [{"id": "merge-evidence", "text": "Does the evidence support the merge gate?"}],
-  "requested_output": {"schema_version": "codex-senior-consult-response/v2"},
+  "requested_output": {"schema_version": "codex-senior-consult-response/v3"},
   "snapshot": {"repository_head": "0123456789abcdef0123456789abcdef01234567", "working_tree_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "plan_fingerprint": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "checkpoint_fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
   "escalation": {"justified": true, "reasons": ["public_contract", "security"], "local_deterministic_checks": ["Read contracts", "Ran offline tests"], "material_impact": "The result controls a public merge gate."}
 }

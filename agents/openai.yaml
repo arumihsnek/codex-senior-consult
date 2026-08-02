@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Senior Consult"
   short_description: "Bounded advisory review for long-running missions"
-  default_prompt: "Use the codex-senior-consult primitive when a caller has a complete sanitized frozen bundle and a material decision remains that local evidence cannot settle. Keep the execution single-pass, tool-free, workspace-free, advisory, and fail-closed."
+  default_prompt: "Use build-bundle, preflight, consult, and status for a bounded caller-neutral v3 consultation when a material decision remains. Keep it single-pass, tool-free, workspace-free, advisory, and fail-closed; treat v1/v2 as historical only."

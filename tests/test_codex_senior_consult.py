@@ -391,13 +391,19 @@ class ConsultProductTests(unittest.TestCase):
         env.pop("CODEX_SENIOR_CONSULT_ACTIVE", None)
         return env
 
-    def invoke(self, bundle, payload=None, extra=None, child_env=None, **fake_options):
+    def invoke(self, bundle, payload=None, extra=None, child_env=None, auto_compat=True, **fake_options):
         self.bundle_path.write_text(json.dumps(bundle))
         fake = self.base / "codex"
         write_fake_codex(fake, payload or response(bundle["mission_id"], bundle["mode"]), **fake_options)
         cmd = [sys.executable, str(SCRIPT), "--bundle", str(self.bundle_path),
                "--mode", bundle["mode"], "--mission-id", bundle["mission_id"],
                "--ledger", str(self.ledger), "--cache-dir", str(self.cache)]
+        if auto_compat:
+            requested = bundle.get("requested_output", {}).get("schema_version")
+            if requested == "codex-senior-consult-response/v1":
+                cmd.append("--legacy-response-v1")
+            elif requested == "codex-senior-consult-response/v2":
+                cmd.append("--historical-response-v2")
         if extra:
             cmd.extend(extra)
         env = self.env_for(fake)
@@ -616,6 +622,7 @@ class ConsultProductTests(unittest.TestCase):
         proc = subprocess.run(
             [sys.executable, str(SCRIPT), "--bundle", str(self.bundle_path),
              "--mode", bundle["mode"], "--mission-id", bundle["mission_id"],
+             "--legacy-response-v1",
              "--ledger", str(self.ledger), "--cache-dir", str(self.cache)],
             text=True, capture_output=True, env=self.env_for(fake), timeout=10)
         parsed = self.parsed(proc)
@@ -692,6 +699,7 @@ class ConsultProductTests(unittest.TestCase):
         proc = subprocess.run(
             [sys.executable, str(SCRIPT), "--bundle", str(self.bundle_path),
              "--mode", bundle["mode"], "--mission-id", bundle["mission_id"],
+             "--legacy-response-v1",
              "--transport-retries", "1", "--ledger", str(self.ledger),
              "--cache-dir", str(self.cache)],
             text=True, capture_output=True, env=self.env_for(fake), timeout=10)
@@ -729,6 +737,7 @@ class ConsultProductTests(unittest.TestCase):
             commands.append([
                 sys.executable, str(SCRIPT), "--bundle", str(path), "--mode", "integrated-review",
                 "--mission-id", "concurrent", "--hard-budget", "1", "--soft-budget", "1",
+                "--legacy-response-v1",
                 "--ledger", str(self.ledger), "--cache-dir", str(self.cache),
             ])
         env = self.env_for(fake)
@@ -1005,6 +1014,16 @@ class ConsultProductTests(unittest.TestCase):
         artifact = self.cache / out["response_artifact"]["relative_path"]
         self.assertEqual(json.loads(artifact.read_text())["response"], v3_response("merge-gate"))
 
+    def test_consult_rejects_historical_schema_without_explicit_flag(self):
+        bundle = complete_bundle(mode="merge-gate")
+        bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v2"}
+        proc = self.invoke(bundle, payload=v2_response("merge-gate"), auto_compat=False)
+        out = self.parsed(proc)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(out["status"], "BUNDLE_INCOMPLETE")
+        self.assertEqual(out["model_processes_consumed"], 0)
+        self.assertIn("--historical-response-v2", out["details"][0])
+
 
 class V3ConstructionPreflightTests(unittest.TestCase):
     @classmethod
@@ -1163,6 +1182,23 @@ class V3ResponseCompatibilityTests(unittest.TestCase):
         ordinary = self.mod.validate_response(payload, "m", "merge-gate", "model", "low", [{"id": "Q1"}], "a" * 40, allow_legacy=False, allow_historical=False)
         historical = self.mod.validate_response(payload, "m", "merge-gate", "model", "low", [{"id": "Q1"}], "a" * 40, allow_legacy=False, allow_historical=True)
         self.assertTrue(ordinary); self.assertEqual(historical, [])
+
+
+class V3DocumentationFixtureTests(unittest.TestCase):
+    def test_reconstructed_fixture_inventory_and_provenance(self):
+        fixture_root = ROOT / "tests" / "fixtures"
+        files = sorted(fixture_root.glob("incomplete-bundles/*.json")) + sorted(fixture_root.glob("malformed-responses/*.json"))
+        self.assertEqual(len(files), 10)
+        for path in files:
+            value = json.loads(path.read_text())
+            self.assertEqual(value["fixture_provenance"], "reconstructed from preserved diagnostic, not a lossless copy of the original response")
+
+    def test_caller_docs_expose_v3_commands_and_historical_boundary(self):
+        docs = "\n".join((ROOT / name).read_text() for name in ["SKILL.md", "references/contracts.md", "references/examples.md"])
+        for command in ("build-bundle", "preflight", "consult", "status"):
+            self.assertIn(command, docs)
+        self.assertIn("codex-senior-consult-response/v3", docs)
+        self.assertIn("historical", docs.casefold())
 
 
 if __name__ == "__main__":
