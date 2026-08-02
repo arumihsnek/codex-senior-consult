@@ -155,7 +155,7 @@ def normalize_construction_bundle(source: dict[str, Any]) -> dict[str, Any]:
 
 def preflight_bundle(source: dict[str, Any], *, mission_id: str, mode: str) -> dict[str, Any]:
     normalized = normalize_construction_bundle(source); diagnostics = normalized["diagnostics"]
-    if normalized["caller_required"]:
+    if diagnostics:
         return {"status": "PREFLIGHT_INVALID", "valid": False, "diagnostics": diagnostics,
                 "model_processes_consumed": 0, "checks": {"bundle": False, "local_state": True,
                 "ledger_cache": True, "replacement": True, "lock": True}}
@@ -526,8 +526,9 @@ def parse_transport_evidence(stdout: str, stderr: str, exit_code: int, timed_out
         if typ not in known: unknown += 1
         if typ not in {"error", "turn.failed"}: continue
         structured = True; error = event.get("error") if isinstance(event.get("error"), dict) else {}
-        code = error.get("code") or event.get("code") or "unclassified"
-        evidence.append({"source": f"jsonl.{typ}", "code": re.sub(r"[^a-z0-9_.-]", "_", str(code).casefold())[:80]})
+        code = str(error.get("code") or event.get("code") or "unclassified")
+        safe_code = "redacted" if any(pattern.search(code) for pattern in SECRET_PATTERNS) else re.sub(r"[^a-z0-9_.-]", "_", code.casefold())[:80]
+        evidence.append({"source": f"jsonl.{typ}", "code": safe_code})
     sanitized = sanitize_transport_stderr(stderr)
     codes = " ".join(item["code"] for item in evidence); text = (codes + " " + sanitized).casefold()
     if timed_out: category = "PROCESS_TIMEOUT"

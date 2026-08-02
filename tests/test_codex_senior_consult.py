@@ -1079,6 +1079,23 @@ class V3ConstructionPreflightTests(unittest.TestCase):
         self.assertIn(("CALLER_REQUIRED_UNKNOWN_PATH", "/unknown"), codes)
         self.assertIn(("CALLER_REQUIRED_NON_NULL", "/mode"), codes)
 
+    def test_preflight_rejects_every_invalid_caller_required_metadata_form(self):
+        cases = [
+            (["/objective", "/objective"], "CALLER_REQUIRED_DUPLICATE_PATH"),
+            (["/unknown"], "CALLER_REQUIRED_UNKNOWN_PATH"),
+            (["not-a-pointer"], "CALLER_REQUIRED_UNKNOWN_PATH"),
+            (["/mode"], "CALLER_REQUIRED_NON_NULL"),
+        ]
+        for caller_required, expected_code in cases:
+            bundle = complete_bundle(mode="merge-gate")
+            bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v3"}
+            bundle["caller_required"] = caller_required
+            result = self.mod.preflight_bundle(bundle, mission_id="mission-1", mode="merge-gate")
+            self.assertFalse(result["valid"], caller_required)
+            self.assertEqual(result["status"], "PREFLIGHT_INVALID")
+            self.assertEqual(result["model_processes_consumed"], 0)
+            self.assertIn(expected_code, {d["code"] for d in result["diagnostics"]})
+
     def test_preflight_distinguishes_null_and_suppresses_cascades_without_process(self):
         bundle = self.mod.build_bundle_skeleton("mission-1", "merge-gate", self.repo)
         with mock.patch.object(self.mod, "run_process", side_effect=AssertionError("model process consumed")):
@@ -1142,6 +1159,18 @@ class V3PrivacyTransportTests(unittest.TestCase):
             evidence = self.mod.parse_transport_evidence(stdout, stderr, code, timed_out)
             self.assertEqual(evidence["transport_category"], expected, evidence)
             self.assertNotIn("sk-abcdefghijklmnopqrstuvwxyz123456", json.dumps(evidence))
+
+    def test_transport_error_codes_are_secret_redacted_before_persistence(self):
+        sensitive_codes = [
+            "sk-abcdefghijklmnopqrstuvwxyz123456",
+            "-----BEGIN PRIVATE KEY-----",
+        ]
+        for sensitive_code in sensitive_codes:
+            stdout = json.dumps({"type": "error", "error": {"code": sensitive_code, "message": "failed"}})
+            evidence = self.mod.parse_transport_evidence(stdout, "", 1, False)
+            rendered = json.dumps(evidence)
+            self.assertNotIn(sensitive_code, rendered)
+            self.assertEqual(evidence["transport_evidence"][0]["code"], "redacted")
 
     def test_malformed_jsonl_is_counted_and_later_events_are_parsed(self):
         stdout = 'not-json\n{"type":"future.event"}\n{"type":"turn.failed","error":{"code":"network_error","message":"down"}}\n'
