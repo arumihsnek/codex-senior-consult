@@ -127,8 +127,11 @@ def _diagnostic(code: str, path: str, state: str, reason: str, expected: str, gu
             "remediation": {"guidance": guidance, "suggested_source": "mission-owned sanitized evidence"},
             "category": "bundle", "model_process_consumed": False}
 
-def normalize_construction_bundle(source: dict[str, Any]) -> dict[str, Any]:
+def normalize_construction_bundle(source: Any) -> dict[str, Any]:
     bundle = json.loads(json.dumps(source)); diagnostics: list[dict[str, Any]] = []
+    if not isinstance(bundle, dict):
+        diagnostics.append(_diagnostic("BUNDLE_ROOT_INVALID", "/", "invalid", "bundle root must be a JSON object", "object", "Provide a JSON object containing the construction bundle."))
+        return {"bundle": {}, "caller_required": [], "diagnostics": diagnostics}
     pointers = bundle.get("caller_required", [])
     if not isinstance(pointers, list):
         diagnostics.append(_diagnostic("CALLER_REQUIRED_INVALID", "/caller_required", "invalid", "caller_required must be an array", "array", "Use unique RFC 6901 pointers.")); pointers = []
@@ -156,7 +159,7 @@ def normalize_construction_bundle(source: dict[str, Any]) -> dict[str, Any]:
     bundle["caller_required"] = remaining
     return {"bundle": bundle, "caller_required": remaining, "diagnostics": diagnostics}
 
-def preflight_bundle(source: dict[str, Any], *, mission_id: str, mode: str) -> dict[str, Any]:
+def preflight_bundle(source: Any, *, mission_id: str, mode: str) -> dict[str, Any]:
     normalized = normalize_construction_bundle(source); diagnostics = normalized["diagnostics"]
     if diagnostics:
         return {"status": "PREFLIGHT_INVALID", "valid": False, "diagnostics": diagnostics,
@@ -291,6 +294,8 @@ def validate_and_prepare_bundle(bundle: Any, mission_id: str, mode: str) -> dict
         if not isinstance(bundle.get(key), str) or not bundle[key].strip(): missing.append(f"{key} must be non-empty")
     for key in ("current_plan", "progress", "candidate_decision"):
         if not isinstance(bundle.get(key), dict) or not bundle[key]: missing.append(f"{key} must be a non-empty object")
+    if "repository" in bundle and not isinstance(bundle["repository"], dict): missing.append("repository must be an object")
+    if not isinstance(bundle.get("diff"), dict) or not bundle["diff"]: missing.append("diff must be a non-empty object")
     if not isinstance(bundle.get("alternatives"), list) or not bundle["alternatives"]: missing.append("alternatives must be a non-empty list")
     if not isinstance(bundle.get("constraints"), list) or not bundle["constraints"] or not all(isinstance(x, str) and x.strip() for x in bundle["constraints"]): missing.append("constraints must be a non-empty string list")
     questions = bundle.get("questions")

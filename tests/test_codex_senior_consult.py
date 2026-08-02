@@ -1118,6 +1118,121 @@ class V3ConstructionPreflightTests(unittest.TestCase):
             self.assertEqual(diagnostic["expected"], {"type": "string containing an RFC 6901 pointer"})
             self.assertNotIn(json.dumps(value), json.dumps(diagnostic, sort_keys=True))
 
+    def test_non_object_bundle_roots_return_one_non_echoing_zero_process_diagnostic(self):
+        sensitive_string = "sk-synthetic-root-marker"
+        private_key_marker = "-----BEGIN PRIVATE KEY-----synthetic-root"
+        cases = [
+            ("empty array", [], []),
+            ("non-empty array", ["ordinary"], []),
+            ("sensitive array", [sensitive_string, private_key_marker], [sensitive_string, private_key_marker]),
+            ("null", None, []),
+            ("boolean", True, []),
+            ("integer", 7, []),
+            ("float", 1.5, []),
+            ("empty string", "", []),
+            ("ordinary string", "ordinary", []),
+            ("sensitive string", sensitive_string, [sensitive_string]),
+        ]
+        for label, root, sensitive_values in cases:
+            with self.subTest(label=label):
+                try:
+                    result = self.mod.preflight_bundle(root, mission_id="mission-1", mode="merge-gate")
+                except Exception as exc:
+                    self.fail(f"preflight raised instead of returning a root diagnostic: {type(exc).__name__}")
+                self.assertEqual((result["status"], result["valid"], result["model_processes_consumed"]),
+                                 ("PREFLIGHT_INVALID", False, 0))
+                self.assertEqual(result["diagnostics"], [{
+                    "code": "BUNDLE_ROOT_INVALID",
+                    "path": "/",
+                    "state": "invalid",
+                    "reason": "bundle root must be a JSON object",
+                    "expected": {"type": "object"},
+                    "remediation": {
+                        "guidance": "Provide a JSON object containing the construction bundle.",
+                        "suggested_source": "mission-owned sanitized evidence",
+                    },
+                    "category": "bundle",
+                    "model_process_consumed": False,
+                }])
+                rendered = json.dumps(result, sort_keys=True)
+                for value in sensitive_values:
+                    self.assertNotIn(value, rendered)
+
+    def test_non_object_roots_share_cli_preflight_consult_and_legacy_boundary(self):
+        sensitive_string = "sk-synthetic-cli-root-marker"
+        private_key_marker = "-----BEGIN PRIVATE KEY-----synthetic-cli-root"
+        roots = [[], ["ordinary"], [sensitive_string, private_key_marker], None, True, 7, 1.5,
+                 "", "ordinary", sensitive_string]
+        fake_bin = self.repo / "fake-bin"
+        fake_bin.mkdir()
+        marker = self.repo / "codex-process-created"
+        fake_codex = fake_bin / "codex"
+        fake_codex.write_text(f"#!/bin/sh\ntouch {marker}\nexit 99\n")
+        fake_codex.chmod(fake_codex.stat().st_mode | stat.S_IXUSR)
+        env = os.environ.copy()
+        env["PATH"] = str(fake_bin)
+        for index, root in enumerate(roots):
+            with self.subTest(index=index, root_type=type(root).__name__):
+                bundle_path = self.repo / f"root-{index}.json"
+                bundle_path.write_text(json.dumps(root))
+                common = ["--mission-id", f"root-cli-{index}", "--mode", "merge-gate",
+                          "--bundle", str(bundle_path)]
+                consult_only = ["--ledger", str(self.repo / f"ledger-{index}.jsonl"),
+                                "--cache-dir", str(self.repo / f"cache-{index}")]
+                commands = [
+                    ("preflight", [sys.executable, str(SCRIPT), "preflight", *common], "PREFLIGHT_INVALID"),
+                    ("consult", [sys.executable, str(SCRIPT), "consult", *common, *consult_only], "BUNDLE_INCOMPLETE"),
+                    ("legacy", [sys.executable, str(SCRIPT), *common, *consult_only], "BUNDLE_INCOMPLETE"),
+                ]
+                for command_name, command, expected_status in commands:
+                    proc = subprocess.run(command, text=True, capture_output=True, env=env, timeout=10)
+                    self.assertEqual(proc.returncode, 2, (command_name, proc.stdout, proc.stderr))
+                    self.assertNotIn("Traceback", proc.stderr)
+                    result = json.loads(proc.stdout)
+                    self.assertEqual(result["status"], expected_status)
+                    self.assertEqual(result["model_processes_consumed"], 0)
+                    self.assertIn({"code": "BUNDLE_ROOT_INVALID", "path": "/"},
+                                  [{"code": d["code"], "path": d["path"]} for d in result["diagnostics"]])
+                    rendered = json.dumps(result, sort_keys=True)
+                    self.assertNotIn(sensitive_string, rendered)
+                    self.assertNotIn(private_key_marker, rendered)
+                self.assertFalse(marker.exists())
+
+    def test_malformed_json_syntax_remains_distinct_from_non_object_root(self):
+        bundle_path = self.repo / "malformed.json"
+        bundle_path.write_text("{")
+        proc = subprocess.run([sys.executable, str(SCRIPT), "preflight", "--mission-id", "syntax-test",
+                               "--mode", "merge-gate", "--bundle", str(bundle_path)],
+                              text=True, capture_output=True, timeout=10)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["status"], "PREFLIGHT_INVALID")
+        self.assertEqual(result["model_processes_consumed"], 0)
+        self.assertEqual(result["diagnostics"][0]["code"], "BUNDLE_JSON_INVALID")
+
+    def test_bounded_preflight_totality_matrix_returns_structured_non_echoing_invalid_results(self):
+        sensitive = "sk-synthetic-totality-marker"
+        object_fields = ["requested_output", "snapshot", "repository", "current_plan", "progress",
+                         "candidate_decision", "diff", "escalation"]
+        list_fields = ["relevant_contracts", "observed_facts", "invalidated_assumptions", "alternatives",
+                       "code_excerpts", "tests", "runtime_evidence", "constraints",
+                       "risks_already_identified", "questions"]
+        wrong_shapes = [None, [sensitive], sensitive, True, 7]
+        for field in object_fields + list_fields:
+            for value in wrong_shapes:
+                with self.subTest(field=field, root_type=type(value).__name__):
+                    bundle = complete_bundle(mode="merge-gate")
+                    bundle["requested_output"] = {"schema_version": "codex-senior-consult-response/v3"}
+                    bundle[field] = value
+                    try:
+                        result = self.mod.preflight_bundle(bundle, mission_id="mission-1", mode="merge-gate")
+                    except Exception as exc:
+                        self.fail(f"{field}={type(value).__name__} raised {type(exc).__name__}")
+                    self.assertEqual((result["status"], result["valid"], result["model_processes_consumed"]),
+                                     ("PREFLIGHT_INVALID", False, 0))
+                    self.assertLessEqual(len(json.dumps(result, sort_keys=True)), 16384)
+                    self.assertNotIn(sensitive, json.dumps(result, sort_keys=True))
+
     def test_non_string_caller_required_element_does_not_suppress_later_diagnostics(self):
         sensitive = {"authorization": "sk-abcdefghijklmnopqrstuvwxyz123456"}
         bundle = complete_bundle(mode="merge-gate")
